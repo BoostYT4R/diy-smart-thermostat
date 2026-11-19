@@ -39,7 +39,7 @@ Dual-Board system with board 1 directly controlling the relay board (furthermore
 | **Y** (cool) | Relay 2 NO (ESP32 D26) |
 | **G** (fan) | Relay 3 NO (ESP32 D27) |
 
-**Power:** the rectifier board turns 24 V AC into about 31 V DC. Two step-down modules rated for 8–85 V input make 5 V over USB-C: one for the ESP32 and one for the display. The relay board gets 5 V from the ESP32's VIN pin. The BME280 is on I²C (SDA D21, SCL D22) and gets 3.3 V.
+**Power:** the rectifier board turns 24 V AC into approx. 31 V DC. Two step-down modules rated for 8–85 V input make 5 V over USB-C: one for the ESP32 (which powers the relay board and BTE280) and one for the display. The relay board gets 5 V from the ESP32's VIN pin. The BME280 is on I²C (SDA D21, SCL D22) and gets 3.3 V.
 
 ## Parts
 
@@ -58,9 +58,9 @@ Dual-Board system with board 1 directly controlling the relay board (furthermore
 | 3D-printed back box + front bezel | 1 | See `enclosure/` |
 | M3 × 20 flat-head screws | 4 | Hold the bezel to the box |
 
-### Parts that didn't work
+### Alternative parts (higher chances of failiure)
 
-Cheap **AC-input buck converters rated 8–32 V** failed. "24 V AC" thermostat power measured up to 28 V, which is about 38 V once it's turned into DC. Two of the converters failed, and the second one took the first touchscreen with it. **Use power modules rated for at least 55 V input, after a rectifier.** [Video of the failure](https://www.youtube.com/shorts/-Lq5AzpIsWE)
+Cheap **AC-input buck converters rated 8–32 V** (requires thorough adjustment)  "24 V AC" thermostat power measured up to 28 V, which is about 38 V once it's turned into DC. In testing, capacitor whine and board failure was notable. **Use power modules rated for at least 55 V input, after a rectifier.** [Alternative part breakdown](https://www.youtube.com/shorts/-Lq5AzpIsWE)
 
 ## Repository layout
 
