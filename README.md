@@ -2,7 +2,7 @@
 
 A home-built replacement for a White-Rodgers wall thermostat. It uses two ESP32 boards, a 7-inch touchscreen, Home Assistant and Google voice control, and runs a Carrier gas furnace and central AC. It's powered entirely from the furnace's own 24 V, with no batteries and no wall plug.
 
-![The touchscreen on the wall](photos/6-first-power-up.jpg)
+![The touchscreen on the wall](photos/wall-mountedV2.jpeg)
 
 ## Features
 
@@ -29,7 +29,7 @@ Board 1 controls the furnace by itself. Home Assistant and the screen add the ex
 
 ## Wiring
 
-![Wiring diagram](photos/wall-mountedV2.jpeg)
+![Wiring diagram](photos/back-box.jpg)
 
 | Wall wire | Goes to |
 |---|---|
