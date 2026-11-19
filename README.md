@@ -25,7 +25,7 @@ Furnace (24 V AC) ──► Board 1: ESP32 + relays + BME280 ◄──► Home A
                           (makes all heating/cooling decisions)   (weather, costs, voice)    (the wall interface)
 ```
 
-Board 1 controls the furnace by itself. Home Assistant and the screen add the extras, so if either one goes down the house still stays warm.
+Dual-Board system with board 1 directly controlling the relay board (furthermore controlling heat) and the onboard display board (board 2) controlling the display offering redundancy
 
 ## Wiring
 
