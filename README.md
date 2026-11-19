@@ -29,7 +29,7 @@ Board 1 controls the furnace by itself. Home Assistant and the screen add the ex
 
 ## Wiring
 
-![Wiring diagram](docs/wiring.png)
+![Wiring diagram](photos/wall-mountedV2.jpeg)
 
 | Wall wire | Goes to |
 |---|---|
