@@ -6,16 +6,16 @@ A home-built replacement for a White-Rodgers wall thermostat. It uses two ESP32 
 
 ## Features
 
-- **Separate heat and cool setpoints.** Each mode remembers its own target.
-- **Safety shutoffs on the controller board.** It turns everything off if the sensor stops reporting, the room passes 85 °F while heating or drops below 55 °F while cooling, or the furnace runs for more than 2 hours. These work even if the server is down.
+- **Separate heat and cool setpoints.** Allowing quick changes to heat and cool modes without having to change the temperature you want for each mode everytime
+- **Safety shutoffs on the controller board.** Automatically detects thermal runaway locally shutting off the furnace or A/C, sending a notification for further failures (works without server)
 - **Smart pre-heat.** It learns how fast the house warms up and starts early, so the room is warm by a set time.
-- **Energy and cost tracking.** Heating and AC cost per day, week and month, plus the whole-house electric bill.
-- **Living standby screen.** A clock, weather and a 3-day forecast, with animated rain, storms, snow and sun, holiday themes, and an orange or blue glow while the furnace or AC runs.
+- **Energy and cost tracking.** Tracks heating and AC cost per day, weekly and monthly, with added support for whole-house cost tracking
+- **Living standby screen.** Including a clock, live weather with animated rain, storms, snow and sun, holiday themes, and an orange or blue glow while the furnace or AC runs.
 - **7-day forecast page** with hourly temperature and rain.
 - **Network page** with WiFi signal and an internet speed test.
-- **Room averaging.** Choose the wall sensor, a Bluetooth sensor in another room, or the average of both.
-- **Air filter reminder** based on real blower hours.
-- **Wireless updates.** Both boards get new code over WiFi.
+- **Room averaging.** Connect the wall sensor, a Govee Bluetooth sensor in another room, or the average of both.
+- **Air filter reminder** VIA timed blower hours
+- **Wireless updates.** 
 - **Voice and phone control** through Google Assistant and the Home Assistant app.
 
 ## How it works
