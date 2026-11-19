@@ -1,0 +1,160 @@
+# Heating + AC cost estimate - Home Assistant package
+# Put in: /docker/homeassistant/packages/heat_cost.yaml  (replaces the old one)
+#
+# Board 1 counts how long the heat (W) and AC (Y) run.
+# Heat cost = hours x (furnace BTU / 100,000 x $ per therm  +  blower kW x $ per kWh)
+# AC cost   = hours x (AC kW + blower kW) x $ per kWh
+# Set the numbers once on the dashboard (bills / furnace label / outdoor AC unit label).
+
+input_number:
+  furnace_btu:
+    name: Furnace input rating
+    min: 20000
+    max: 150000
+    step: 1000
+    unit_of_measurement: BTU/h
+    mode: box
+    icon: mdi:fire
+  gas_price_therm:
+    name: Gas price
+    min: 0
+    max: 10
+    step: 0.001
+    unit_of_measurement: "$/therm"
+    mode: box
+    icon: mdi:cash
+  blower_watts:
+    name: Furnace blower power
+    min: 0
+    max: 1500
+    step: 10
+    unit_of_measurement: W
+    mode: box
+    icon: mdi:fan
+  electric_price_kwh:
+    name: Electricity price
+    min: 0
+    max: 2
+    step: 0.001
+    unit_of_measurement: "$/kWh"
+    mode: box
+    icon: mdi:flash
+  ac_kw:
+    name: AC outdoor unit power
+    min: 0
+    max: 8
+    step: 0.1
+    unit_of_measurement: kW
+    mode: box
+    icon: mdi:snowflake
+
+utility_meter:
+  heat_hours_today:
+    name: Heat hours today
+    source: sensor.garage_hall_thermostat_heat_runtime
+    cycle: daily
+  heat_hours_week:
+    name: Heat hours this week
+    source: sensor.garage_hall_thermostat_heat_runtime
+    cycle: weekly
+  heat_hours_month:
+    name: Heat hours this month
+    source: sensor.garage_hall_thermostat_heat_runtime
+    cycle: monthly
+  cool_hours_today:
+    name: Cool hours today
+    source: sensor.garage_hall_thermostat_cool_runtime
+    cycle: daily
+  cool_hours_week:
+    name: Cool hours this week
+    source: sensor.garage_hall_thermostat_cool_runtime
+    cycle: weekly
+  cool_hours_month:
+    name: Cool hours this month
+    source: sensor.garage_hall_thermostat_cool_runtime
+    cycle: monthly
+
+template:
+  - sensor:
+      # ---- heating ----
+      - name: Heat cost per hour
+        unique_id: heat_cost_per_hour
+        unit_of_measurement: "$/h"
+        icon: mdi:cash-clock
+        state: >
+          {% set gas = states('input_number.furnace_btu')|float(0) / 100000
+                       * states('input_number.gas_price_therm')|float(0) %}
+          {% set elec = states('input_number.blower_watts')|float(0) / 1000
+                        * states('input_number.electric_price_kwh')|float(0) %}
+          {{ (gas + elec) | round(2) }}
+      - name: Heat cost today
+        unique_id: heat_cost_today
+        unit_of_measurement: "$"
+        icon: mdi:cash
+        state: "{{ (states('sensor.heat_hours_today')|float(0) * states('sensor.heat_cost_per_hour')|float(0)) | round(2) }}"
+      - name: Heat cost this week
+        unique_id: heat_cost_week
+        unit_of_measurement: "$"
+        icon: mdi:cash
+        state: "{{ (states('sensor.heat_hours_week')|float(0) * states('sensor.heat_cost_per_hour')|float(0)) | round(2) }}"
+      - name: Heat cost this month
+        unique_id: heat_cost_month
+        unit_of_measurement: "$"
+        icon: mdi:cash-multiple
+        state: "{{ (states('sensor.heat_hours_month')|float(0) * states('sensor.heat_cost_per_hour')|float(0)) | round(2) }}"
+
+      # ---- AC ----
+      - name: Cool cost per hour
+        unique_id: cool_cost_per_hour
+        unit_of_measurement: "$/h"
+        icon: mdi:cash-clock
+        state: >
+          {{ ((states('input_number.ac_kw')|float(0) + states('input_number.blower_watts')|float(0) / 1000)
+              * states('input_number.electric_price_kwh')|float(0)) | round(2) }}
+      - name: Cool cost today
+        unique_id: cool_cost_today
+        unit_of_measurement: "$"
+        icon: mdi:cash
+        state: "{{ (states('sensor.cool_hours_today')|float(0) * states('sensor.cool_cost_per_hour')|float(0)) | round(2) }}"
+      - name: Cool cost this week
+        unique_id: cool_cost_week
+        unit_of_measurement: "$"
+        icon: mdi:cash
+        state: "{{ (states('sensor.cool_hours_week')|float(0) * states('sensor.cool_cost_per_hour')|float(0)) | round(2) }}"
+      - name: Cool cost this month
+        unique_id: cool_cost_month
+        unit_of_measurement: "$"
+        icon: mdi:cash-multiple
+        state: "{{ (states('sensor.cool_hours_month')|float(0) * states('sensor.cool_cost_per_hour')|float(0)) | round(2) }}"
+
+      # ---- totals ----
+      - name: Energy cost this month
+        unique_id: energy_cost_month
+        unit_of_measurement: "$"
+        icon: mdi:cash-multiple
+        state: "{{ (states('sensor.heat_cost_this_month')|float(0) + states('sensor.cool_cost_this_month')|float(0)) | round(2) }}"
+      - name: Energy cost last month
+        unique_id: energy_cost_last_month
+        unit_of_measurement: "$"
+        icon: mdi:cash-multiple
+        state: >
+          {% set h = state_attr('sensor.heat_hours_month', 'last_period') | float(0) %}
+          {% set c = state_attr('sensor.cool_hours_month', 'last_period') | float(0) %}
+          {{ (h * states('sensor.heat_cost_per_hour')|float(0) + c * states('sensor.cool_cost_per_hour')|float(0)) | round(2) }}
+
+  # ---- last 7 days of heating / cooling hours (for the display's Energy page) ----
+  - triggers:
+      - trigger: time
+        at: "23:59:30"
+    sensor:
+      - name: HVAC Daily History
+        unique_id: hvac_daily_history
+        icon: mdi:chart-bar
+        state: "{{ now().date() }}"
+        attributes:
+          heat: >
+            {% set old = (this.attributes.heat | default('')).split(',') | reject('eq', '') | list %}
+            {{ (old + [ (states('sensor.heat_hours_today') | float(0)) | round(2) | string ])[-6:] | join(',') }}
+          cool: >
+            {% set old = (this.attributes.cool | default('')).split(',') | reject('eq', '') | list %}
+            {{ (old + [ (states('sensor.cool_hours_today') | float(0)) | round(2) | string ])[-6:] | join(',') }}

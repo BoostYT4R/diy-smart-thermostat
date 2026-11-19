@@ -1,0 +1,607 @@
+# Board 1 - HVAC controller (ELEGOO ESP-WROOM-32)
+# BME280 + VOGURTIME relay (W / Y / G) + Bluetooth proxy for the Govee sensor
+# Same wiring as the bench test.
+
+esphome:
+  name: thermostat-board1
+  friendly_name: Thermostat
+  on_boot:
+    priority: -100
+    then:
+      - text_sensor.template.publish:
+          id: safety_status
+          state: "OK"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf          # recommended for Bluetooth proxy
+
+logger:
+
+preferences:
+  flash_write_interval: 15min   # saves the heat-runtime counter without wearing out flash
+
+api:
+  reboot_timeout: 0s       # keep running normally while the NAS is off at night
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # use_address: 192.168.1.x   # optional: set if you reserve a fixed IP on your router
+  ap:                      # backup hotspot if WiFi fails
+    ssid: "Thermostat Fallback"
+    password: !secret fallback_password
+
+captive_portal:
+
+# Internet time (works even while the NAS is off) - used by Smart Pre-heat
+time:
+  - platform: sntp
+    id: clk
+    timezone: America/Los_Angeles
+
+# ---------- Bluetooth proxy (Govee -> Home Assistant) ----------
+esp32_ble_tracker:
+
+bluetooth_proxy:
+  active: true
+
+# ---------- BME280 ----------
+i2c:
+  sda: 21
+  scl: 22
+  scan: true               # log shows the sensor's address at boot
+
+sensor:
+  - platform: bme280_i2c
+    address: 0x76          # if the log says "not found", change to 0x77
+    update_interval: 15s
+    temperature:
+      name: "Room Temperature"
+      id: room_temp
+      filters:
+        - offset: -0.83    # sensor reads ~1.5 F high (box heat); -0.83 C = -1.5 F
+      on_value:
+        - lambda: 'if (!std::isnan(x)) id(last_temp_ms) = millis();'
+    humidity:
+      name: "Room Humidity"
+      id: room_humidity
+    pressure:
+      name: "Room Pressure"
+
+  # Govee room sensor, via Home Assistant (in F). Not available while the NAS is off.
+  - platform: homeassistant
+    id: govee_temp
+    entity_id: sensor.stair_hall_h5075_d5cb_temperature
+    internal: true
+
+  # The temperature the thermostat actually controls to (see "Temperature Source")
+  - platform: template
+    id: control_temp
+    name: "Control Temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 15s
+    lambda: |-
+      float w = id(room_temp).state;
+      float gF = id(govee_temp).state;
+      bool ha = api::global_api_server != nullptr && api::global_api_server->is_connected();
+      bool gok = ha && !std::isnan(gF) && gF > 30 && gF < 110;
+      float g = gok ? (gF - 32.0f) * 5.0f / 9.0f : NAN;
+      auto src = id(temp_source).active_index();
+      int m = src.has_value() ? (int) *src : 0;          // 0 wall, 1 average, 2 govee
+      if (m == 1 && gok && !std::isnan(w)) return (w + g) / 2.0f;
+      if (m == 2 && gok) return g;
+      return w;                                          // wall sensor (also the fallback)
+
+  # How fast the house warms up (learned from real heating runs)
+  - platform: template
+    id: heat_rate_sensor
+    name: "Learned Heat Rate"
+    unit_of_measurement: "°F/h"
+    icon: mdi:chart-line
+    accuracy_decimals: 1
+    update_interval: 300s
+    lambda: 'return id(heat_rate);'
+
+  # Total hours the AC has run (Home Assistant turns this into $)
+  - platform: template
+    name: "Cool Runtime"
+    id: cool_runtime
+    unit_of_measurement: "h"
+    device_class: duration
+    state_class: total_increasing
+    accuracy_decimals: 2
+    update_interval: 60s
+    lambda: 'return id(cool_secs) / 3600.0;'
+
+  # Air filter: % left, based on blower hours since it was replaced
+  - platform: template
+    name: "Filter Life Left"
+    id: filter_left
+    unit_of_measurement: "%"
+    icon: mdi:air-filter
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      float used = id(filter_secs) / 3600.0f;
+      float life = std::max(1.0f, (float) id(filter_hours).state);
+      return std::max(0.0f, std::min(100.0f, 100.0f - used / life * 100.0f));
+
+  # Total hours the heat has run (Home Assistant turns this into $)
+  - platform: template
+    name: "Heat Runtime"
+    id: heat_runtime
+    unit_of_measurement: "h"
+    device_class: duration
+    state_class: total_increasing
+    accuracy_decimals: 2
+    update_interval: 60s
+    lambda: 'return id(heat_secs) / 3600.0;'
+
+# ---------- Relays (board set to HIGH-level trigger -> not inverted) ----------
+# internal: true = hidden from Home Assistant, so only the thermostat can switch them
+switch:
+  - platform: gpio
+    id: heat_relay
+    name: "W Heat Relay"
+    pin:
+      number: 25
+      inverted: false   # board jumpers are set to HIGH trigger
+    restore_mode: ALWAYS_OFF
+    interlock: [heat_relay, cool_relay]   # heat and cool never on together
+    internal: true
+    on_turn_on:
+      - lambda: |-
+          id(heat_on_ms) = millis();
+          id(heat_start_t) = id(control_temp).state;
+    on_turn_off:
+      - lambda: |-
+          // learn degrees-per-hour from runs of 10+ minutes
+          uint32_t dt = millis() - id(heat_on_ms);
+          float t0 = id(heat_start_t), t1 = id(control_temp).state;
+          if (dt >= 10UL * 60 * 1000 && !std::isnan(t0) && !std::isnan(t1)) {
+            float dF = (t1 - t0) * 1.8f;
+            if (dF > 0.3f) {
+              float r = std::min(std::max(dF / (dt / 3600000.0f), 0.5f), 20.0f);
+              id(heat_rate) = id(heat_rate) * 0.7f + r * 0.3f;
+              id(heat_rate_sensor).publish_state(id(heat_rate));
+            }
+          }
+
+  - platform: gpio
+    id: cool_relay
+    name: "Y Cool Relay"
+    pin:
+      number: 26
+      inverted: false   # board jumpers are set to HIGH trigger
+    restore_mode: ALWAYS_OFF
+    interlock: [heat_relay, cool_relay]
+    internal: true
+
+  - platform: gpio
+    id: fan_relay
+    name: "G Fan Relay"
+    pin:
+      number: 27
+      inverted: false   # board jumpers are set to HIGH trigger
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+  - platform: template
+    id: preheat_on
+    name: "Smart Pre-heat"
+    icon: mdi:sun-clock
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+# ---------- The thermostat ----------
+# ESPHome works in Celsius; Home Assistant shows it in Fahrenheit.
+climate:
+  - platform: thermostat
+    id: hvac
+    name: "Thermostat"
+    sensor: control_temp       # wall sensor, average, or Govee ("Temperature Source")
+
+    visual:
+      min_temperature: 10      # 50 F
+      max_temperature: 30      # 86 F
+      temperature_step: 0.5
+
+    # How far past the setpoint before it turns on / off (0.5 C ~ 1 F)
+    heat_deadband: 0.5
+    heat_overrun: 0.5
+    cool_deadband: 0.5
+    cool_overrun: 0.5
+
+    # Protects the furnace and AC compressor from rapid on/off.
+    # Relays can take up to 3 min to react - that's on purpose.
+    min_heating_off_time: 120s
+    min_heating_run_time: 120s
+    min_cooling_off_time: 180s
+    min_cooling_run_time: 180s
+    min_fanning_off_time: 30s
+    min_fanning_run_time: 30s
+    min_idle_time: 30s
+    min_fan_mode_switching_time: 15s
+
+    # Furnace runs its own blower during heat, so only W turns on.
+    heat_action:
+      - script.stop: fan_overrun
+      - lambda: 'id(was_running) = true;'
+      - switch.turn_off: cool_relay
+      - if:
+          condition:
+            lambda: 'return id(hvac).fan_mode != climate::CLIMATE_FAN_ON;'
+          then:
+            - switch.turn_off: fan_relay
+      - switch.turn_on: heat_relay
+
+    # AC needs Y (compressor) + G (fan) together.
+    cool_action:
+      - script.stop: fan_overrun
+      - lambda: 'id(was_running) = true;'
+      - switch.turn_off: heat_relay
+      - switch.turn_on: cool_relay
+      - switch.turn_on: fan_relay
+
+    fan_only_action:
+      - switch.turn_off: heat_relay
+      - switch.turn_off: cool_relay
+      - switch.turn_on: fan_relay
+
+    # After heat/cool stops, the fan keeps going for "Fan Run After Cycle" minutes
+    idle_action:
+      - switch.turn_off: heat_relay
+      - switch.turn_off: cool_relay
+      - if:
+          condition:
+            lambda: 'return id(hvac).fan_mode != climate::CLIMATE_FAN_ON;'
+          then:
+            - if:
+                condition:
+                  lambda: 'return id(was_running) && id(fan_overrun_min).state > 0;'
+                then:
+                  - switch.turn_on: fan_relay
+                  - script.execute: fan_overrun
+                else:
+                  - switch.turn_off: fan_relay
+      - lambda: 'id(was_running) = false;'
+
+    # Fan "On" = blower runs all the time. "Auto" = only when heating/cooling.
+    fan_mode_on_action:
+      - switch.turn_on: fan_relay
+    fan_mode_auto_action:
+      - script.stop: fan_overrun
+      - if:
+          condition:
+            lambda: |-
+              return id(hvac).action != climate::CLIMATE_ACTION_COOLING &&
+                     id(hvac).action != climate::CLIMATE_ACTION_FAN;
+          then:
+            - switch.turn_off: fan_relay
+
+    # Clear the safety message once you turn it back on
+    on_state:
+      - lambda: |-
+          if (id(hvac).mode != climate::CLIMATE_MODE_OFF &&
+              id(safety_status).state != "OK")
+            id(safety_status).publish_state("OK");
+      # Independent heat / cool setpoints: each mode remembers its own temperature,
+      # so heat can be set ABOVE cool (e.g. heat 71, cool 68). Only one mode runs at a time.
+      - lambda: |-
+          static int last_mode = -1;
+          auto m = id(hvac).mode;
+          float lowF = id(hvac).target_temperature_low * 1.8f + 32.0f;
+          float highF = id(hvac).target_temperature_high * 1.8f + 32.0f;
+          if ((int) m != last_mode) {
+            last_mode = (int) m;
+            // switched mode: put back what this mode was set to last time
+            if (m == climate::CLIMATE_MODE_HEAT && fabsf(lowF - id(heat_set).state) > 0.3f) {
+              auto c = id(hvac).make_call(); c.set_target_temperature_low((id(heat_set).state - 32.0f) / 1.8f); c.perform(); return;
+            }
+            if (m == climate::CLIMATE_MODE_COOL && fabsf(highF - id(cool_set).state) > 0.3f) {
+              auto c = id(hvac).make_call(); c.set_target_temperature_high((id(cool_set).state - 32.0f) / 1.8f); c.perform(); return;
+            }
+            return;
+          }
+          // changed from HA / Google / display while in a mode: remember it for that mode
+          if (m == climate::CLIMATE_MODE_HEAT && !std::isnan(lowF) && fabsf(lowF - id(heat_set).state) > 0.3f)
+            id(heat_set).publish_state(roundf(lowF));
+          if (m == climate::CLIMATE_MODE_COOL && !std::isnan(highF) && fabsf(highF - id(cool_set).state) > 0.3f)
+            id(cool_set).publish_state(roundf(highF));
+
+    default_preset: Home
+    preset:
+      - name: Home
+        default_target_temperature_low: 20     # heat to 68 F
+        default_target_temperature_high: 24.5  # cool above 76 F
+        mode: "OFF"                            # starts OFF - you turn it on
+      - name: Away
+        default_target_temperature_low: 16     # 61 F
+        default_target_temperature_high: 28    # 82 F
+      - name: Sleep
+        default_target_temperature_low: 18.5   # 65 F
+        default_target_temperature_high: 25.5  # 78 F
+
+# ---------- SAFETY (runs on the ESP32 - works even with the NAS off) ----------
+# Any of these turns the mode to OFF and all relays off.
+# Turn the thermostat back on from HA / display / Google once you've checked why.
+#  - Sensor stops reporting for 2 min (unplugged / broken)
+#  - Heat running and room over 85 F
+#  - Cooling running and room under 55 F
+#  - Heat relay on for 2 hours straight (change 2 below if you want longer)
+# A frozen ESP32 is caught by its built-in watchdog: it reboots,
+# and every relay starts OFF (restore_mode: ALWAYS_OFF).
+
+globals:
+  - id: last_temp_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: heat_on_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: was_running
+    type: bool
+    initial_value: 'false'
+  - id: heat_start_t
+    type: float
+    initial_value: 'NAN'
+  - id: heat_rate              # learned warm-up speed, F per hour (starts at a typical 4)
+    type: float
+    restore_value: true
+    initial_value: '4.0'
+  - id: cool_secs              # total seconds the AC (Y) has been on - for the AC cost
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: filter_secs            # blower seconds since the air filter was replaced
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: heat_secs              # total seconds the heat (W) has been on - kept through reboots
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+
+text_sensor:
+  - platform: template
+    id: preheat_status
+    name: "Pre-heat Status"
+    icon: mdi:sun-clock
+
+  - platform: template
+    id: safety_status
+    name: "Safety Status"
+    icon: mdi:shield-alert
+
+script:
+  - id: fan_overrun
+    mode: restart
+    then:
+      - delay: !lambda 'return (uint32_t) id(fan_overrun_min).state * 60000;'
+      - if:
+          condition:
+            lambda: |-
+              return id(hvac).fan_mode != climate::CLIMATE_FAN_ON &&
+                     id(hvac).action != climate::CLIMATE_ACTION_COOLING &&
+                     id(hvac).action != climate::CLIMATE_ACTION_FAN;
+          then:
+            - switch.turn_off: fan_relay
+
+  - id: safety_off
+    mode: single
+    parameters:
+      reason: string
+    then:
+      - logger.log:
+          level: WARN
+          format: "SAFETY SHUTOFF: %s"
+          args: ['reason.c_str()']
+      - climate.control:
+          id: hvac
+          mode: "OFF"
+      - script.stop: fan_overrun
+      - switch.turn_off: heat_relay
+      - switch.turn_off: cool_relay
+      - switch.turn_off: fan_relay
+      - text_sensor.template.publish:
+          id: safety_status
+          state: !lambda 'return reason;'
+
+interval:
+  - interval: 30s
+    then:
+      - lambda: |-
+          const uint32_t MAX_HEAT_MS = 2UL * 60 * 60 * 1000;   // 2 hours
+          uint32_t now = millis();
+          bool heating = id(heat_relay).state;
+          bool cooling = id(cool_relay).state;
+
+          // Nothing running and mode off = nothing to protect
+          if (id(hvac).mode == climate::CLIMATE_MODE_OFF && !heating && !cooling) return;
+
+          float t = id(room_temp).state;
+          bool stale = (now > 120000) && (now - id(last_temp_ms) > 120000);
+          if (stale || std::isnan(t)) {
+            id(safety_off).execute("Sensor not reporting");
+            return;
+          }
+          float tc = id(control_temp).state;
+          float hot  = std::isnan(tc) ? t : std::max(t, tc);    // check both the wall sensor
+          float cold = std::isnan(tc) ? t : std::min(t, tc);    // and the control temperature
+          if (heating && hot > 29.4) {          // 85 F
+            id(safety_off).execute("Too hot while heating (over 85F)");
+            return;
+          }
+          if (cooling && cold < 12.8) {         // 55 F
+            id(safety_off).execute("Too cold while cooling (under 55F)");
+            return;
+          }
+          if (heating && (now - id(heat_on_ms) > MAX_HEAT_MS)) {
+            id(safety_off).execute("Heat ran 2+ hours straight");
+            return;
+          }
+
+  # ---------- Smart Pre-heat ----------
+  # Starts heating early so the house reaches "Ready Temperature" by "Ready By",
+  # using the learned warm-up speed. Only acts in Heat mode. Runs on the ESP32.
+  - interval: 60s
+    then:
+      - lambda: |-
+          static int done_day = -1;
+          static std::string last;
+          std::string st = "Off";
+          auto now = id(clk).now();
+          if (id(preheat_on).state && now.is_valid()) {
+            int nowm = now.hour * 60 + now.minute;
+            int rdy = id(preheat_time).hour * 60 + id(preheat_time).minute;
+            int until = rdy - nowm; if (until < 0) until += 1440;
+            float cur = id(control_temp).state;
+            float goalF = id(preheat_temp).state;
+            float need = std::isnan(cur) ? 0 : goalF - (cur * 1.8f + 32);
+            float lead = need > 0 ? need / std::max(id(heat_rate), 0.5f) * 60.0f + 10.0f : 0;
+            lead = std::min(lead, 180.0f);
+            int start = rdy - (int) lead; if (start < 0) start += 1440;
+            char b[48];
+            int sh = start / 60 % 12; if (sh == 0) sh = 12;
+            if (id(hvac).mode != climate::CLIMATE_MODE_HEAT) st = "Waiting for Heat mode";
+            else if (done_day == now.day_of_year) st = "Done for today";
+            else { snprintf(b, sizeof(b), "Starts about %d:%02d %s", sh, start % 60, start / 60 < 12 ? "AM" : "PM"); st = b; }
+            if (id(hvac).mode == climate::CLIMATE_MODE_HEAT && done_day != now.day_of_year &&
+                (until <= (int) lead || until == 0)) {
+              float goalC = (goalF - 32.0f) / 1.8f;
+              auto call = id(hvac).make_call();
+              call.set_target_temperature_low(goalC);
+              call.perform();
+              done_day = now.day_of_year;
+              st = "Warming up";
+            }
+          }
+          if (st != last) { last = st; id(preheat_status).publish_state(st); }
+
+  # Heat runtime counter (for the cost calculation in Home Assistant)
+  - interval: 10s
+    then:
+      - lambda: |-
+          if (id(heat_relay).state) id(heat_secs) += 10;
+          if (id(cool_relay).state) id(cool_secs) += 10;
+          // the furnace blower runs for heat, cool and fan -> that's what uses up the filter
+          if (id(heat_relay).state || id(cool_relay).state || id(fan_relay).state) id(filter_secs) += 10;
+
+number:
+  - platform: template
+    id: fan_overrun_min
+    name: "Fan Run After Cycle"
+    icon: mdi:fan-clock
+    unit_of_measurement: "min"
+    min_value: 0
+    max_value: 30
+    step: 1
+    initial_value: 3
+    optimistic: true
+    restore_value: true
+    mode: box
+
+  - platform: template
+    id: preheat_temp
+    name: "Pre-heat Ready Temperature"
+    icon: mdi:thermometer-chevron-up
+    unit_of_measurement: "°F"
+    min_value: 60
+    max_value: 78
+    step: 1
+    initial_value: 68
+    optimistic: true
+    restore_value: true
+    mode: box
+
+  - platform: template
+    id: filter_hours
+    name: "Filter Lifetime"
+    icon: mdi:air-filter
+    unit_of_measurement: "h"
+    min_value: 50
+    max_value: 1500
+    step: 10
+    initial_value: 300          # blower hours; ~3 months for a basic 1-inch filter
+    optimistic: true
+    restore_value: true
+    mode: box
+
+
+  # The two setpoints (in F). Change them from HA, the display or Google.
+  - platform: template
+    id: heat_set
+    name: "Heat Setpoint"
+    icon: mdi:fire
+    unit_of_measurement: "°F"
+    min_value: 50
+    max_value: 85
+    step: 1
+    initial_value: 68
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - lambda: |-
+          if (id(hvac).mode == climate::CLIMATE_MODE_HEAT &&
+              fabsf(id(hvac).target_temperature_low * 1.8f + 32.0f - x) > 0.3f) {
+            auto c = id(hvac).make_call(); c.set_target_temperature_low((x - 32.0f) / 1.8f); c.perform();
+          }
+  - platform: template
+    id: cool_set
+    name: "Cool Setpoint"
+    icon: mdi:snowflake
+    unit_of_measurement: "°F"
+    min_value: 55
+    max_value: 90
+    step: 1
+    initial_value: 76
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - lambda: |-
+          if (id(hvac).mode == climate::CLIMATE_MODE_COOL &&
+              fabsf(id(hvac).target_temperature_high * 1.8f + 32.0f - x) > 0.3f) {
+            auto c = id(hvac).make_call(); c.set_target_temperature_high((x - 32.0f) / 1.8f); c.perform();
+          }
+
+select:
+  - platform: template
+    id: temp_source
+    name: "Temperature Source"
+    icon: mdi:thermometer-lines
+    optimistic: true
+    restore_value: true
+    initial_option: "Wall sensor"
+    options: ["Wall sensor", "Average", "Govee room"]
+    on_value:
+      - component.update: control_temp
+
+datetime:
+  - platform: template
+    id: preheat_time
+    type: time
+    name: "Pre-heat Ready By"
+    optimistic: true
+    restore_value: true
+    initial_value: "06:30:00"
+
+button:
+  - platform: template
+    name: "Filter Replaced"
+    icon: mdi:air-filter
+    on_press:
+      - lambda: 'id(filter_secs) = 0;'
+      - component.update: filter_left

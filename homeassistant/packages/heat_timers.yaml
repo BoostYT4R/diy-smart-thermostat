@@ -1,0 +1,117 @@
+# Heat timers for the DIY thermostat
+#  - "Heat now"    : heat to a set temperature for a set number of minutes, then turn off
+#  - "Heat later"  : wait X minutes, then do "Heat now"
+#  - "Cancel"      : stop both timers and turn heating off
+# Thermostat entity: climate.garage_hall_thermostat_thermostat
+
+input_number:
+  heat_timer_target:
+    name: Heat to
+    min: 60
+    max: 80
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer
+  heat_timer_run_minutes:
+    name: Heat for
+    min: 5
+    max: 240
+    step: 5
+    unit_of_measurement: min
+    icon: mdi:timer-outline
+  heat_timer_delay_minutes:
+    name: Start in
+    min: 5
+    max: 180
+    step: 5
+    unit_of_measurement: min
+    icon: mdi:timer-sand
+
+timer:
+  heat_run:
+    name: Heating time left
+    restore: true
+  heat_delay:
+    name: Heating starts in
+    restore: true
+
+script:
+  heat_now:
+    alias: Heat now
+    icon: mdi:fire
+    sequence:
+      - action: timer.cancel
+        target:
+          entity_id: timer.heat_delay
+      - action: climate.set_hvac_mode
+        target:
+          entity_id: climate.garage_hall_thermostat_thermostat
+        data:
+          hvac_mode: heat
+      - action: climate.set_temperature
+        target:
+          entity_id: climate.garage_hall_thermostat_thermostat
+        data:
+          target_temp_low: "{{ states('input_number.heat_timer_target') | float }}"
+          target_temp_high: >-
+            {{ [ states('input_number.heat_timer_target') | float + 4,
+                 state_attr('climate.garage_hall_thermostat_thermostat', 'target_temp_high') | float(76) ] | max }}
+      - action: timer.start
+        target:
+          entity_id: timer.heat_run
+        data:
+          duration: >-
+            {% set m = states('input_number.heat_timer_run_minutes') | int %}
+            {{ '%02d:%02d:00' % (m // 60, m % 60) }}
+
+  heat_later:
+    alias: Heat later
+    icon: mdi:timer-sand
+    sequence:
+      - action: timer.start
+        target:
+          entity_id: timer.heat_delay
+        data:
+          duration: >-
+            {% set m = states('input_number.heat_timer_delay_minutes') | int %}
+            {{ '%02d:%02d:00' % (m // 60, m % 60) }}
+
+  heat_cancel:
+    alias: Cancel heat timers
+    icon: mdi:cancel
+    sequence:
+      - action: timer.cancel
+        target:
+          entity_id:
+            - timer.heat_run
+            - timer.heat_delay
+      - action: climate.set_hvac_mode
+        target:
+          entity_id: climate.garage_hall_thermostat_thermostat
+        data:
+          hvac_mode: "off"
+
+automation:
+  - id: heat_timer_delayed_start
+    alias: Heat timer - delayed start
+    triggers:
+      - trigger: event
+        event_type: timer.finished
+        event_data:
+          entity_id: timer.heat_delay
+    actions:
+      - action: script.heat_now
+
+  - id: heat_timer_times_up
+    alias: Heat timer - time's up
+    triggers:
+      - trigger: event
+        event_type: timer.finished
+        event_data:
+          entity_id: timer.heat_run
+    actions:
+      - action: climate.set_hvac_mode
+        target:
+          entity_id: climate.garage_hall_thermostat_thermostat
+        data:
+          hvac_mode: "off"

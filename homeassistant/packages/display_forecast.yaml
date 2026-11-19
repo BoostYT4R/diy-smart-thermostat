@@ -1,0 +1,158 @@
+# 3-day forecast for the thermostat display - Home Assistant package
+# Put in: /docker/homeassistant/packages/display_forecast.yaml
+# Creates sensor.display_forecast (standby 3-day) and sensor.display_forecast_7_day (forecast page)
+# If your weather entity isn't weather.forecast_home, change it in BOTH places below.
+
+template:
+  - triggers:
+      - trigger: time_pattern
+        minutes: /30
+      - trigger: homeassistant
+        event: start
+    actions:
+      - action: weather.get_forecasts
+        target:
+          entity_id: weather.forecast_home
+        data:
+          type: daily
+        response_variable: fc
+    sensor:
+      - name: Display Forecast
+        unique_id: display_forecast
+        icon: mdi:weather-partly-cloudy
+        state: >
+          {% set ns = namespace(out=[]) %}
+          {% for d in fc['weather.forecast_home'].forecast %}
+            {% set t = as_local(as_datetime(d.datetime)) %}
+            {% if t.date() > now().date() and ns.out | length < 3 %}
+              {% set ns.out = ns.out + [ t.strftime('%a') ~ '|' ~ d.condition ~ '|'
+                   ~ (d.temperature | round(0) | int) ~ '|'
+                   ~ (d.templow | default(d.temperature) | round(0) | int) ] %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.out | join(';') }}
+
+  # 7-day forecast + hour-by-hour temperature and rain for the display's forecast page
+  #   days: "Sun|rainy|64|51|0.12|40;..."  (day, condition, high, low, rain in, chance % or -1)
+  #   h0..h6: "14|63|0.00|10;15|62|0.02|30;..."  (hour, temp, rain in, chance % or -1) for today+N
+  - triggers:
+      - trigger: time_pattern
+        minutes: /30
+      - trigger: homeassistant
+        event: start
+    actions:
+      - action: weather.get_forecasts
+        target:
+          entity_id: weather.forecast_home
+        data:
+          type: daily
+        response_variable: daily
+      - action: weather.get_forecasts
+        target:
+          entity_id: weather.forecast_home
+        data:
+          type: hourly
+        response_variable: hourly
+    sensor:
+      - name: Display Forecast 7 day
+        unique_id: display_forecast_7day
+        icon: mdi:calendar-week
+        state: "{{ now().strftime('%H:%M') }}"
+        attributes:
+          days: >
+            {% set ns = namespace(out=[]) %}
+            {% for d in daily['weather.forecast_home'].forecast %}
+              {% set t = as_local(as_datetime(d.datetime)) %}
+              {% if t.date() >= now().date() and ns.out | length < 7 %}
+                {% set ns.out = ns.out + [ t.strftime('%a') ~ '|' ~ d.condition ~ '|'
+                     ~ (d.temperature | round(0) | int) ~ '|'
+                     ~ (d.templow | default(d.temperature) | round(0) | int) ~ '|'
+                     ~ (d.precipitation | default(0) | float(0) | round(2)) ~ '|'
+                     ~ (d.precipitation_probability | default(-1) | int(-1)) ] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.out | join(';') }}
+          h0: >
+            {% set day = (now() + timedelta(days=0)).date() %}
+            {% set ns = namespace(out=[]) %}
+            {% for h in hourly['weather.forecast_home'].forecast %}
+              {% set t = as_local(as_datetime(h.datetime)) %}
+              {% if t.date() == day and ns.out | length < 24 %}
+                {% set ns.out = ns.out + [ t.hour ~ '|' ~ (h.temperature | round(0) | int) ~ '|'
+                     ~ (h.precipitation | default(0) | float(0) | round(2)) ~ '|'
+                     ~ (h.precipitation_probability | default(-1) | int(-1)) ] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.out | join(';') }}
+          h1: >
+            {% set day = (now() + timedelta(days=1)).date() %}
+            {% set ns = namespace(out=[]) %}
+            {% for h in hourly['weather.forecast_home'].forecast %}
+              {% set t = as_local(as_datetime(h.datetime)) %}
+              {% if t.date() == day and ns.out | length < 24 %}
+                {% set ns.out = ns.out + [ t.hour ~ '|' ~ (h.temperature | round(0) | int) ~ '|'
+                     ~ (h.precipitation | default(0) | float(0) | round(2)) ~ '|'
+                     ~ (h.precipitation_probability | default(-1) | int(-1)) ] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.out | join(';') }}
+          h2: >
+            {% set day = (now() + timedelta(days=2)).date() %}
+            {% set ns = namespace(out=[]) %}
+            {% for h in hourly['weather.forecast_home'].forecast %}
+              {% set t = as_local(as_datetime(h.datetime)) %}
+              {% if t.date() == day and ns.out | length < 24 %}
+                {% set ns.out = ns.out + [ t.hour ~ '|' ~ (h.temperature | round(0) | int) ~ '|'
+                     ~ (h.precipitation | default(0) | float(0) | round(2)) ~ '|'
+                     ~ (h.precipitation_probability | default(-1) | int(-1)) ] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.out | join(';') }}
+          h3: >
+            {% set day = (now() + timedelta(days=3)).date() %}
+            {% set ns = namespace(out=[]) %}
+            {% for h in hourly['weather.forecast_home'].forecast %}
+              {% set t = as_local(as_datetime(h.datetime)) %}
+              {% if t.date() == day and ns.out | length < 24 %}
+                {% set ns.out = ns.out + [ t.hour ~ '|' ~ (h.temperature | round(0) | int) ~ '|'
+                     ~ (h.precipitation | default(0) | float(0) | round(2)) ~ '|'
+                     ~ (h.precipitation_probability | default(-1) | int(-1)) ] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.out | join(';') }}
+          h4: >
+            {% set day = (now() + timedelta(days=4)).date() %}
+            {% set ns = namespace(out=[]) %}
+            {% for h in hourly['weather.forecast_home'].forecast %}
+              {% set t = as_local(as_datetime(h.datetime)) %}
+              {% if t.date() == day and ns.out | length < 24 %}
+                {% set ns.out = ns.out + [ t.hour ~ '|' ~ (h.temperature | round(0) | int) ~ '|'
+                     ~ (h.precipitation | default(0) | float(0) | round(2)) ~ '|'
+                     ~ (h.precipitation_probability | default(-1) | int(-1)) ] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.out | join(';') }}
+          h5: >
+            {% set day = (now() + timedelta(days=5)).date() %}
+            {% set ns = namespace(out=[]) %}
+            {% for h in hourly['weather.forecast_home'].forecast %}
+              {% set t = as_local(as_datetime(h.datetime)) %}
+              {% if t.date() == day and ns.out | length < 24 %}
+                {% set ns.out = ns.out + [ t.hour ~ '|' ~ (h.temperature | round(0) | int) ~ '|'
+                     ~ (h.precipitation | default(0) | float(0) | round(2)) ~ '|'
+                     ~ (h.precipitation_probability | default(-1) | int(-1)) ] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.out | join(';') }}
+          h6: >
+            {% set day = (now() + timedelta(days=6)).date() %}
+            {% set ns = namespace(out=[]) %}
+            {% for h in hourly['weather.forecast_home'].forecast %}
+              {% set t = as_local(as_datetime(h.datetime)) %}
+              {% if t.date() == day and ns.out | length < 24 %}
+                {% set ns.out = ns.out + [ t.hour ~ '|' ~ (h.temperature | round(0) | int) ~ '|'
+                     ~ (h.precipitation | default(0) | float(0) | round(2)) ~ '|'
+                     ~ (h.precipitation_probability | default(-1) | int(-1)) ] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.out | join(';') }}

@@ -1,0 +1,3539 @@
+# Board 2 - Thermostat touchscreen v2 (Waveshare ESP32-S3-Touch-LCD-7, 800x480)
+# Pages: HOME (Vine style, odometer numbers) / STANDBY (clock, weather + 3-day forecast, set temp) / HISTORY (graphs + heat cost)
+# v3.3 - independent heat / cool setpoints (heat can be above cool)
+# v3.4 - whole-house PG&E electric bill on the Energy page (Opower integration)
+# v3.5 - standby: strong animated heat / cool glow + rising embers / cool air streaks while running
+#
+# BEFORE BUILDING: fill in the 4 entity IDs under "substitutions" (see notes) and your WiFi password.
+# In Home Assistant: ESPHome -> Thermostat Display -> Configure ->
+#   turn ON "Allow the device to perform Home Assistant actions"
+
+substitutions:
+  thermostat: climate.garage_hall_thermostat_thermostat
+  room_humidity: sensor.garage_hall_thermostat_room_humidity
+  govee_temp: sensor.stair_hall_h5075_d5cb_temperature
+  govee_humidity: sensor.stair_hall_h5075_d5cb_humidity
+  weather: weather.forecast_home                               # from the Met.no integration
+  forecast: sensor.display_forecast                            # from display_forecast.yaml (HA package)
+  forecast7: sensor.display_forecast_7_day                     # from display_forecast.yaml (HA package)
+  cost_today: sensor.heat_cost_today                           # from heat_cost.yaml
+  cost_week: sensor.heat_cost_this_week
+  # Board 1 settings (created by board1-thermostat.yaml)
+  t_source: select.garage_hall_thermostat_temperature_source
+  pre_switch: switch.garage_hall_thermostat_smart_pre_heat
+  pre_time: time.garage_hall_thermostat_pre_heat_ready_by
+  pre_temp: number.garage_hall_thermostat_pre_heat_ready_temperature
+  pre_status: sensor.garage_hall_thermostat_pre_heat_status
+  fan_after: number.garage_hall_thermostat_fan_run_after_cycle
+  heat_rate: sensor.garage_hall_thermostat_learned_heat_rate
+  safety: sensor.garage_hall_thermostat_safety_status
+  # Speedtest.net integration in Home Assistant (Settings > Devices & services > Add > Speedtest.net)
+  speed_down: sensor.speedtest_download
+  speed_up: sensor.speedtest_upload
+  speed_ping: sensor.speedtest_ping
+  # cost / energy (heat_cost.yaml) + filter (Board 1)
+  cost_month: sensor.heat_cost_this_month
+  heat_sp: number.garage_hall_thermostat_heat_setpoint
+  cool_sp: number.garage_hall_thermostat_cool_setpoint
+  ac_today: sensor.cool_cost_today
+  ac_week: sensor.cool_cost_this_week
+  ac_month: sensor.cool_cost_this_month
+  cost_last: sensor.energy_cost_last_month
+  # Whole house electric bill from PG&E (Opower integration, ~1-2 days behind)
+  house_cost: sensor.elec_account_XXXXXXXXXX_current_bill_electric_cost_to_date
+  house_fcst: sensor.elec_account_XXXXXXXXXX_current_bill_electric_forecasted_cost
+  house_typ: sensor.elec_account_XXXXXXXXXX_typical_monthly_electric_cost
+  heat_h_today: sensor.heat_hours_today
+  cool_h_today: sensor.cool_hours_today
+  hvac_hist: sensor.hvac_daily_history
+  filter_left: sensor.garage_hall_thermostat_filter_life_left
+  filter_reset: button.garage_hall_thermostat_filter_replaced
+
+esphome:
+  name: thermostat-display
+  friendly_name: Thermostat Display
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          // Build the graph dots/bars once (cheap small objects, moved later instead of recreated)
+          // Square, non-clickable objects: much cheaper to draw than anti-aliased circles
+          auto mk = [](lv_obj_t *p, uint32_t c, int w, int h) -> lv_obj_t * {
+            lv_obj_t *o = lv_obj_create(p);
+            lv_obj_remove_style_all(o);
+          #if LVGL_VERSION_MAJOR >= 9
+            lv_obj_remove_flag(o, (lv_obj_flag_t) (LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+          #else
+            lv_obj_clear_flag(o, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+          #endif
+            lv_obj_set_size(o, w, h);
+            lv_obj_set_style_bg_color(o, lv_color_hex(c), 0);
+            lv_obj_set_style_bg_opa(o, LV_OPA_TRANSP, 0);
+            return o;
+          };
+          for (int i = 0; i < 48; i++) {
+            id(dots_rt).push_back(mk(id(chart_t), 0xFFFFFF, 5, 5));
+            id(dots_gt).push_back(mk(id(chart_t), 0x34C759, 5, 5));
+            id(dots_rh).push_back(mk(id(chart_h), 0x4DA3FF, 5, 5));
+            id(dots_gh).push_back(mk(id(chart_h), 0x34C759, 5, 5));
+            id(bars_heat).push_back(mk(id(chart_r), 0xFF7A1A, 11, 0));
+            id(bars_cool).push_back(mk(id(chart_r), 0x4DA3FF, 11, 0));
+          }
+      - script.execute: draw_charts
+      - script.execute: update_setpoints
+      - script.execute: update_clock
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: y
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: y
+      CONFIG_SPIRAM_RODATA: y
+      # Free up internal RAM so WiFi can start (the screen uses a lot of it)
+      CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP: y
+      CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL: "4096"
+      CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM: "6"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: WARN          # less logging = more CPU for drawing
+
+api:
+  reboot_timeout: 0s   # don't reboot while the NAS is off at night
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # use_address: 192.168.1.x   # optional: set if you reserve a fixed IP on your router
+  ap:
+    ssid: "Thermostat Display Fallback"
+    password: !secret fallback_password
+
+captive_portal:
+
+# ---------------- Hardware ----------------
+i2c:
+  sda: 8
+  scl: 9
+  frequency: 400kHz
+
+ch422g:
+  - id: ch422g_hub
+
+# backlight + LCD reset are handled by the display model preset (CH422G pins 2 and 3)
+
+display:
+  - platform: mipi_rgb
+    model: ESP32-S3-TOUCH-LCD-7-800X480
+    id: main_display
+    auto_clear_enabled: false
+    update_interval: never
+
+touchscreen:
+  - platform: gt911
+    id: my_touch
+    interrupt_pin: 4
+    reset_pin:
+      ch422g: ch422g_hub
+      number: 1
+
+time:
+  - platform: homeassistant
+    id: ha_time
+    timezone: America/Los_Angeles     # don't rely on Home Assistant's time zone setting
+    on_time_sync:
+      - script.execute: update_clock
+    on_time:
+      - seconds: 0
+        then:
+          - script.execute: update_clock
+
+# ---------------- Fonts (only the characters we use = small + fast) ----------------
+font:
+  - file: "gfonts://Roboto@500"
+    id: font_temp
+    size: 170
+    bpp: 4
+    glyphs: "0123456789"
+  - file: "gfonts://Roboto@500"
+    id: font_set
+    size: 84
+    bpp: 4
+    glyphs: "0123456789"
+  - file: "gfonts://Outfit@600"     # clock: clean geometric, semi-bold
+    id: font_clock
+    size: 132
+    bpp: 4
+    glyphs: "0123456789: "
+  - file:
+      type: web
+      url: "https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf"
+    id: icon_s
+    size: 36
+    bpp: 4
+    glyphs: ["\U000F0599", "\U000F0594", "\U000F0595", "\U000F0590", "\U000F0597", "\U000F0596",
+             "\U000F0598", "\U000F0591", "\U000F0593", "\U000F059D", "\U000F0592",
+             "\U000F058E", "\U000F012A", "\U000F004D",
+             "\U000F091F", "\U000F0922", "\U000F0925", "\U000F0928", "\U000F05AA",
+             "\U000F0425", "\U000F0238", "\U000F0717", "\U000F0210", "\U000F0F2F",
+             "\U000F0F19", "\U000F03D8", "\U000F0AB0", "\U000F0BA3", "\U000F171B", "\U000F0405",
+             "\U000F0493", "\U000F0026"]
+  - file:      # holiday particles: flower, sparkle, bat, maple leaf, snowflake
+      type: web
+      url: "https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf"
+    id: icon_xs
+    size: 26
+    bpp: 4
+    glyphs: ["\U000F024A", "\U000F0AE2", "\U000F0B5F", "\U000F0C93", "\U000F0717"]
+  - file:
+      type: web
+      url: "https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf"
+    id: icon_m
+    size: 60
+    bpp: 4
+    glyphs: ["\U000F0425", "\U000F0238", "\U000F0717", "\U000F006A", "\U000F0210", "\U000F081D"]
+  - file:
+      type: web
+      url: "https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf"
+    id: icon_l
+    size: 104
+    bpp: 4
+    glyphs: ["\U000F0599", "\U000F0594", "\U000F0595", "\U000F0590", "\U000F0597", "\U000F0596",
+             "\U000F0598", "\U000F0591", "\U000F0593", "\U000F059D", "\U000F0592", "\U000F0F2F"]
+
+# ---------------- State kept on the display ----------------
+globals:
+  - { id: sel, type: int, initial_value: '0' }                # 0 = heat setpoint selected, 1 = cool
+  - { id: loc_low, type: float, initial_value: '68' }
+  - { id: loc_high, type: float, initial_value: '76' }
+  - { id: last_edit, type: uint32_t, initial_value: '0' }
+  - { id: show_week, type: bool, initial_value: 'false' }
+  - { id: st_pre_min, type: int, initial_value: '390' }        # settings page local copies
+  - { id: st_pre_temp, type: float, initial_value: '68' }
+  - { id: st_fan, type: int, initial_value: '1' }
+  - { id: st_edit, type: uint32_t, initial_value: '0' }
+  - { id: spd_testing, type: uint32_t, initial_value: '0' }    # when "Run speed test" was pressed
+  - { id: wx_now, type: int, initial_value: '0' }
+  - { id: fc_sel, type: int, initial_value: '0' }               # selected day on the forecast page               # weather effect: 0 none 1 rain 2 storm 3 snow 4 hail 5 hot sun
+  # history: 48 points. 24h = one point / 30 min, 7d = one point / 210 min
+  - { id: d_rt, type: 'std::vector<float>', initial_value: 'std::vector<float>(48, NAN)' }
+  - { id: d_gt, type: 'std::vector<float>', initial_value: 'std::vector<float>(48, NAN)' }
+  - { id: d_rh, type: 'std::vector<float>', initial_value: 'std::vector<float>(48, NAN)' }
+  - { id: d_gh, type: 'std::vector<float>', initial_value: 'std::vector<float>(48, NAN)' }
+  - { id: d_heat, type: 'std::vector<float>', initial_value: 'std::vector<float>(48, 0)' }
+  - { id: d_cool, type: 'std::vector<float>', initial_value: 'std::vector<float>(48, 0)' }
+  - { id: w_rt, type: 'std::vector<float>', initial_value: 'std::vector<float>(48, NAN)' }
+  - { id: w_gt, type: 'std::vector<float>', initial_value: 'std::vector<float>(48, NAN)' }
+  - { id: w_rh, type: 'std::vector<float>', initial_value: 'std::vector<float>(48, NAN)' }
+  - { id: w_gh, type: 'std::vector<float>', initial_value: 'std::vector<float>(48, NAN)' }
+  - { id: w_heat, type: 'std::vector<float>', initial_value: 'std::vector<float>(48, 0)' }
+  - { id: w_cool, type: 'std::vector<float>', initial_value: 'std::vector<float>(48, 0)' }
+  # accumulators: [rt_sum, rt_n, gt_sum, gt_n, rh_sum, rh_n, gh_sum, gh_n, heat_min, cool_min, samples]
+  - { id: acc_d, type: 'std::vector<float>', initial_value: 'std::vector<float>(11, 0)' }
+  - { id: acc_w, type: 'std::vector<float>', initial_value: 'std::vector<float>(11, 0)' }
+  - { id: dots_rt, type: 'std::vector<lv_obj_t *>' }
+  - { id: dots_gt, type: 'std::vector<lv_obj_t *>' }
+  - { id: dots_rh, type: 'std::vector<lv_obj_t *>' }
+  - { id: dots_gh, type: 'std::vector<lv_obj_t *>' }
+  - { id: bars_heat, type: 'std::vector<lv_obj_t *>' }
+  - { id: bars_cool, type: 'std::vector<lv_obj_t *>' }
+
+# ---------------- Data from Home Assistant ----------------
+sensor:
+  - platform: wifi_signal
+    id: wifi_rssi
+    update_interval: 10s
+    internal: true
+
+  - platform: homeassistant
+    id: cur_temp
+    entity_id: ${thermostat}
+    attribute: current_temperature
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !std::isnan(x);'
+          then:
+            - lvgl.roller.update:
+                id: r_t1
+                selected_index: !lambda 'return ((int) roundf(x) / 10) % 10;'
+                animated: true
+            - lvgl.roller.update:
+                id: r_t0
+                selected_index: !lambda 'return (int) roundf(x) % 10;'
+                animated: true
+            - lambda: |-
+                char b[24]; snprintf(b, sizeof(b), "Inside %.0f°", x);
+                lv_label_set_text(id(clock_inside), b);
+
+  - platform: homeassistant
+    id: ha_low
+    entity_id: ${heat_sp}
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !std::isnan(x) && millis() - id(last_edit) > 3000;'
+          then:
+            - lambda: 'id(loc_low) = x;'
+            - script.execute: update_setpoints
+
+  - platform: homeassistant
+    id: ha_high
+    entity_id: ${cool_sp}
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !std::isnan(x) && millis() - id(last_edit) > 3000;'
+          then:
+            - lambda: 'id(loc_high) = x;'
+            - script.execute: update_setpoints
+
+  - platform: homeassistant
+    id: room_h
+    entity_id: ${room_humidity}
+    on_value:
+      - lambda: |-
+          const char *t = "--"; uint32_t c = 0x5A5A5A;
+          if (!std::isnan(x)) {
+            if (x < 30)      { t = "Dry";         c = 0xFF9F0A; }
+            else if (x > 60) { t = "Humid";       c = 0x4DA3FF; }
+            else             { t = "Comfortable"; c = 0x34C759; }
+          }
+          lv_label_set_text(id(comfort_lbl), t);
+          lv_obj_set_style_text_color(id(comfort_lbl), lv_color_hex(c), 0);
+      - if:
+          condition:
+            lambda: 'return !std::isnan(x);'
+          then:
+            - lvgl.roller.update:
+                id: r_hu1
+                selected_index: !lambda 'return std::min(99, std::max(0, (int) roundf(x))) / 10;'
+                animated: true
+            - lvgl.roller.update:
+                id: r_hu0
+                selected_index: !lambda 'return std::min(99, std::max(0, (int) roundf(x))) % 10;'
+                animated: true
+
+  - platform: homeassistant
+    id: gov_t
+    entity_id: ${govee_temp}
+    on_value:
+      - script.execute: update_now_cards
+
+  - platform: homeassistant
+    id: gov_h
+    entity_id: ${govee_humidity}
+    on_value:
+      - script.execute: update_now_cards
+
+  - platform: homeassistant
+    id: pre_temp_ha
+    entity_id: ${pre_temp}
+    on_value:
+      - lambda: 'if (!std::isnan(x) && millis() - id(st_edit) > 3000) id(st_pre_temp) = x;'
+      - script.execute: refresh_settings
+  - platform: homeassistant
+    id: fan_ha
+    entity_id: ${fan_after}
+    on_value:
+      - lambda: 'if (!std::isnan(x) && millis() - id(st_edit) > 3000) id(st_fan) = (int) x;'
+      - script.execute: refresh_settings
+  - platform: homeassistant
+    id: rate_ha
+    entity_id: ${heat_rate}
+    on_value:
+      - script.execute: refresh_settings
+
+  - platform: homeassistant
+    id: cost_m
+    entity_id: ${cost_month}
+    on_value: [ script.execute: refresh_energy ]
+  - platform: homeassistant
+    id: cc_d
+    entity_id: ${ac_today}
+    on_value: [ script.execute: refresh_energy, script.execute: update_now_cards ]
+  - platform: homeassistant
+    id: cc_w
+    entity_id: ${ac_week}
+    on_value: [ script.execute: refresh_energy, script.execute: update_now_cards ]
+  - platform: homeassistant
+    id: cc_m
+    entity_id: ${ac_month}
+    on_value: [ script.execute: refresh_energy ]
+  - platform: homeassistant
+    id: cost_last
+    entity_id: ${cost_last}
+    on_value: [ script.execute: refresh_energy ]
+  - platform: homeassistant
+    id: house_cost
+    entity_id: ${house_cost}
+    on_value: [ script.execute: refresh_energy ]
+  - platform: homeassistant
+    id: house_fcst
+    entity_id: ${house_fcst}
+    on_value: [ script.execute: refresh_energy ]
+  - platform: homeassistant
+    id: house_typ
+    entity_id: ${house_typ}
+    on_value: [ script.execute: refresh_energy ]
+  - platform: homeassistant
+    id: hh_today
+    entity_id: ${heat_h_today}
+    on_value: [ script.execute: refresh_energy ]
+  - platform: homeassistant
+    id: ch_today
+    entity_id: ${cool_h_today}
+    on_value: [ script.execute: refresh_energy ]
+  - platform: homeassistant
+    id: filter_pct
+    entity_id: ${filter_left}
+    on_value: [ script.execute: refresh_settings ]
+
+  - platform: homeassistant
+    id: spd_down
+    entity_id: ${speed_down}
+    on_value:
+      - lambda: 'id(spd_testing) = 0;'
+      - script.execute: refresh_net
+  - platform: homeassistant
+    id: spd_up
+    entity_id: ${speed_up}
+    on_value:
+      - script.execute: refresh_net
+  - platform: homeassistant
+    id: spd_ping
+    entity_id: ${speed_ping}
+    on_value:
+      - script.execute: refresh_net
+
+  - platform: homeassistant
+    id: cost_d
+    entity_id: ${cost_today}
+    on_value:
+      - script.execute: update_now_cards
+      - script.execute: refresh_energy
+
+  - platform: homeassistant
+    id: cost_w
+    entity_id: ${cost_week}
+    on_value:
+      - script.execute: update_now_cards
+      - script.execute: refresh_energy
+
+  - platform: homeassistant
+    id: weather_temp
+    entity_id: ${weather}
+    attribute: temperature
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !std::isnan(x);'
+          then:
+            - lvgl.roller.update:
+                id: r_ws1
+                selected_index: !lambda 'return std::min(99, std::max(0, (int) roundf(x))) / 10;'
+                animated: true
+            - lvgl.roller.update:
+                id: r_ws0
+                selected_index: !lambda 'return std::min(99, std::max(0, (int) roundf(x))) % 10;'
+                animated: true
+            - lvgl.roller.update:
+                id: r_wl1
+                selected_index: !lambda 'return std::min(99, std::max(0, (int) roundf(x))) / 10;'
+                animated: true
+            - lvgl.roller.update:
+                id: r_wl0
+                selected_index: !lambda 'return std::min(99, std::max(0, (int) roundf(x))) % 10;'
+                animated: true
+
+text_sensor:
+  - platform: wifi_info
+    ssid:
+      id: net_ssid
+      internal: true
+    ip_address:
+      id: net_ip
+      internal: true
+  - platform: homeassistant
+    id: fc7_days
+    entity_id: ${forecast7}
+    attribute: days
+    on_value: [ script.execute: refresh_fc ]
+  - platform: homeassistant
+    id: fh0
+    entity_id: ${forecast7}
+    attribute: h0
+    on_value: [ script.execute: refresh_fc ]
+  - platform: homeassistant
+    id: fh1
+    entity_id: ${forecast7}
+    attribute: h1
+    on_value: [ script.execute: refresh_fc ]
+  - platform: homeassistant
+    id: fh2
+    entity_id: ${forecast7}
+    attribute: h2
+    on_value: [ script.execute: refresh_fc ]
+  - platform: homeassistant
+    id: fh3
+    entity_id: ${forecast7}
+    attribute: h3
+    on_value: [ script.execute: refresh_fc ]
+  - platform: homeassistant
+    id: fh4
+    entity_id: ${forecast7}
+    attribute: h4
+    on_value: [ script.execute: refresh_fc ]
+  - platform: homeassistant
+    id: fh5
+    entity_id: ${forecast7}
+    attribute: h5
+    on_value: [ script.execute: refresh_fc ]
+  - platform: homeassistant
+    id: fh6
+    entity_id: ${forecast7}
+    attribute: h6
+    on_value: [ script.execute: refresh_fc ]
+  - platform: homeassistant
+    id: hist_heat
+    entity_id: ${hvac_hist}
+    attribute: heat
+    on_value: [ script.execute: refresh_energy ]
+  - platform: homeassistant
+    id: hist_cool
+    entity_id: ${hvac_hist}
+    attribute: cool
+    on_value: [ script.execute: refresh_energy ]
+  - platform: homeassistant
+    id: src_state
+    entity_id: ${t_source}
+    on_value:
+      - script.execute: refresh_settings
+  - platform: homeassistant
+    id: pre_sw
+    entity_id: ${pre_switch}
+    on_value:
+      - script.execute: refresh_settings
+  - platform: homeassistant
+    id: pre_time_ha
+    entity_id: ${pre_time}
+    on_value:
+      - lambda: |-
+          int h = 0, m = 0;
+          if (millis() - id(st_edit) > 3000 && sscanf(x.c_str(), "%d:%d", &h, &m) == 2) id(st_pre_min) = h * 60 + m;
+      - script.execute: refresh_settings
+  - platform: homeassistant
+    id: pre_status_ha
+    entity_id: ${pre_status}
+    on_value:
+      - script.execute: refresh_settings
+  - platform: homeassistant
+    id: safety_txt
+    entity_id: ${safety}
+    on_value:
+      - script.execute: refresh_settings
+
+  - platform: homeassistant
+    id: hvac_mode
+    entity_id: ${thermostat}
+    on_value:
+      - lambda: |-
+          const char *icon = "\U000F0425", *txt = "Off"; uint32_t col = 0x8A8F98;
+          if (x == "heat")           { icon = "\U000F0238"; txt = "Heat"; col = 0xFF7A1A; id(sel) = 0; }
+          else if (x == "cool")      { icon = "\U000F0717"; txt = "Cool"; col = 0x4DA3FF; id(sel) = 1; }
+          else if (x == "heat_cool") { icon = "\U000F006A"; txt = "Auto"; col = 0xFFFFFF; }
+          else if (x == "fan_only")  { icon = "\U000F0210"; txt = "Fan";  col = 0x34C759; }
+          lv_label_set_text(id(mode_icon), icon);
+          lv_obj_set_style_text_color(id(mode_icon), lv_color_hex(col), 0);
+          lv_label_set_text(id(mode_txt), txt);
+          bool h = (x == "heat" || x == "heat_cool"), c = (x == "cool" || x == "heat_cool");
+          lv_obj_set_style_opa(id(heat_box), h ? LV_OPA_COVER : LV_OPA_30, 0);
+          lv_obj_set_style_opa(id(cool_box), c ? LV_OPA_COVER : LV_OPA_30, 0);
+      - script.execute: move_sel
+      - script.execute: update_status
+      - script.execute: update_standby
+
+  - platform: homeassistant
+    id: hvac_action
+    entity_id: ${thermostat}
+    attribute: hvac_action
+    on_value:
+      - lambda: |-
+          if (x == "heating") {
+            lv_label_set_text(id(act_icon), "\U000F0238");
+            lv_obj_set_style_text_color(id(act_icon), lv_color_hex(0xFF7A1A), 0);
+            lv_obj_set_style_opa(id(act_icon), LV_OPA_COVER, 0);
+          } else if (x == "cooling") {
+            lv_label_set_text(id(act_icon), "\U000F0717");
+            lv_obj_set_style_text_color(id(act_icon), lv_color_hex(0x4DA3FF), 0);
+            lv_obj_set_style_opa(id(act_icon), LV_OPA_COVER, 0);
+          } else {
+            lv_obj_set_style_opa(id(act_icon), LV_OPA_TRANSP, 0);
+          }
+      - script.execute: update_status
+      - script.execute: update_standby
+      - script.execute: apply_theme
+
+  - platform: homeassistant
+    id: fan_mode
+    entity_id: ${thermostat}
+    attribute: fan_mode
+    on_value:
+      - lambda: |-
+          bool on = (x == "on");
+          lv_label_set_text(id(fan_icon), on ? "\U000F0210" : "\U000F0210");
+          lv_obj_set_style_text_color(id(fan_icon), lv_color_hex(on ? 0x34C759 : 0x8A8F98), 0);
+          lv_label_set_text(id(fan_txt), on ? "On" : "Auto");
+
+  - platform: homeassistant
+    id: preset
+    entity_id: ${thermostat}
+    attribute: preset_mode
+    on_value:
+      - script.execute: update_status
+      - script.execute: refresh_settings
+      - if:
+          condition:
+            lambda: 'return x == "Away";'
+          then:
+            - lvgl.page.show:
+                id: clock_page
+                animation: NONE
+
+  - platform: homeassistant
+    id: weather_cond
+    entity_id: ${weather}
+    on_value:
+      - lambda: |-
+          const char *g = "\U000F0590", *t = "Cloudy"; uint32_t c = 0xCFCFCF;
+          if (x == "sunny")                { g = "\U000F0599"; t = "Sunny";         c = 0xFFD60A; }
+          else if (x == "clear-night")     { g = "\U000F0594"; t = "Clear";         c = 0xB8C4FF; }
+          else if (x == "partlycloudy")    { g = "\U000F0595"; t = "Partly cloudy"; c = 0xFFE58A; }
+          else if (x == "rainy")           { g = "\U000F0597"; t = "Rain";          c = 0x4DA3FF; }
+          else if (x == "pouring")         { g = "\U000F0596"; t = "Heavy rain";    c = 0x4DA3FF; }
+          else if (x == "snowy" || x == "snowy-rainy") { g = "\U000F0598"; t = "Snow"; c = 0xFFFFFF; }
+          else if (x == "fog")             { g = "\U000F0591"; t = "Fog";           c = 0xAEB4BC; }
+          else if (x == "lightning" || x == "lightning-rainy") { g = "\U000F0593"; t = "Storms"; c = 0xBF5AF2; }
+          else if (x == "windy" || x == "windy-variant") { g = "\U000F059D"; t = "Windy"; c = 0xCFCFCF; }
+          else if (x == "hail")            { g = "\U000F0592"; t = "Hail";          c = 0xFFFFFF; }
+          else if (x == "exceptional")     { g = "\U000F0F2F"; t = "Alert";         c = 0xFF9F0A; }
+          lv_label_set_text(id(w_icon_s), g);
+          lv_label_set_text(id(w_icon_l), g);
+          lv_obj_set_style_text_color(id(w_icon_s), lv_color_hex(c), 0);
+          lv_obj_set_style_text_color(id(w_icon_l), lv_color_hex(c), 0);
+          lv_label_set_text(id(w_cond_l), t);
+      - script.execute: apply_theme
+
+  # 3-day forecast, "Mon|rainy|64|51;Tue|sunny|66|50;Wed|cloudy|63|49"
+  - platform: homeassistant
+    id: forecast_txt
+    entity_id: ${forecast}
+    on_value:
+      - lambda: |-
+          lv_obj_t *dl[3] = { id(fc_d0), id(fc_d1), id(fc_d2) };
+          lv_obj_t *il[3] = { id(fc_i0), id(fc_i1), id(fc_i2) };
+          lv_obj_t *hl[3] = { id(fc_h0), id(fc_h1), id(fc_h2) };
+          lv_obj_t *ll[3] = { id(fc_l0), id(fc_l1), id(fc_l2) };
+          std::string s = x; size_t p = 0;
+          for (int i = 0; i < 3; i++) {
+            std::string seg;
+            if (p != std::string::npos && p < s.size()) {
+              size_t q = s.find(';', p);
+              seg = s.substr(p, q == std::string::npos ? std::string::npos : q - p);
+              p = (q == std::string::npos) ? std::string::npos : q + 1;
+            }
+            std::string f[4]; size_t a = 0;
+            for (int k = 0; k < 4; k++) {
+              if (a >= seg.size()) break;
+              size_t b = seg.find('|', a);
+              f[k] = seg.substr(a, b == std::string::npos ? std::string::npos : b - a);
+              a = (b == std::string::npos) ? seg.size() : b + 1;
+            }
+            const std::string &cnd = f[1];
+            const char *g = "\U000F0590"; uint32_t c = 0xCFCFCF;
+            if (cnd == "sunny")                   { g = "\U000F0599"; c = 0xFFD60A; }
+            else if (cnd == "clear-night")        { g = "\U000F0594"; c = 0xB8C4FF; }
+            else if (cnd == "partlycloudy")       { g = "\U000F0595"; c = 0xFFE58A; }
+            else if (cnd == "rainy")              { g = "\U000F0597"; c = 0x4DA3FF; }
+            else if (cnd == "pouring")            { g = "\U000F0596"; c = 0x4DA3FF; }
+            else if (cnd == "snowy" || cnd == "snowy-rainy") { g = "\U000F0598"; c = 0xFFFFFF; }
+            else if (cnd == "fog")                { g = "\U000F0591"; c = 0xAEB4BC; }
+            else if (cnd == "lightning" || cnd == "lightning-rainy") { g = "\U000F0593"; c = 0xBF5AF2; }
+            else if (cnd == "windy" || cnd == "windy-variant") { g = "\U000F059D"; }
+            else if (cnd == "hail")               { g = "\U000F0592"; c = 0xFFFFFF; }
+            else if (cnd == "exceptional")        { g = "\U000F0F2F"; c = 0xFF9F0A; }
+            bool ok = !seg.empty();
+            lv_label_set_text(dl[i], ok ? f[0].c_str() : "");
+            lv_label_set_text(il[i], ok ? g : "");
+            lv_obj_set_style_text_color(il[i], lv_color_hex(c), 0);
+            lv_label_set_text(hl[i], ok ? (f[2] + "°").c_str() : "");
+            lv_label_set_text(ll[i], ok ? (f[3] + "°").c_str() : "");
+          }
+
+# Holiday theme: "Auto" follows the calendar (on ~5 days before, through the day).
+# Pick a holiday here in Home Assistant to preview it any time.
+select:
+  - platform: template
+    id: holiday_override
+    name: "Holiday Theme"
+    icon: mdi:party-popper
+    optimistic: true
+    restore_value: true
+    initial_option: "Auto"
+    options: ["Auto", "Off", "Diwali", "Holi", "Easter", "Summer Solstice", "Halloween", "Thanksgiving", "Christmas"]
+    on_value:
+      - script.execute: apply_theme
+      - script.execute: refresh_settings
+
+  # Preview the standby weather effects any time ("Auto" follows the real weather)
+  - platform: template
+    id: weather_fx_override
+    name: "Weather Effect"
+    icon: mdi:weather-lightning-rainy
+    optimistic: true
+    restore_value: true
+    initial_option: "Auto"
+    options: ["Auto", "Off", "Rain", "Thunderstorm", "Snow", "Hail", "Sun (hot day)"]
+    on_value:
+      - script.execute: apply_theme
+
+# ---------------- Logic ----------------
+script:
+  - id: update_setpoints
+    then:
+      - lvgl.roller.update:
+          id: r_l1
+          selected_index: !lambda 'return ((int) roundf(id(loc_low)) / 10) % 10;'
+          animated: true
+      - lvgl.roller.update:
+          id: r_l0
+          selected_index: !lambda 'return (int) roundf(id(loc_low)) % 10;'
+          animated: true
+      - lvgl.roller.update:
+          id: r_h1
+          selected_index: !lambda 'return ((int) roundf(id(loc_high)) / 10) % 10;'
+          animated: true
+      - lvgl.roller.update:
+          id: r_h0
+          selected_index: !lambda 'return (int) roundf(id(loc_high)) % 10;'
+          animated: true
+      - script.execute: update_status
+      - script.execute: update_standby
+
+  # standby page: set temp in heat (orange) / cool (blue) colors
+  - id: update_standby
+    then:
+      - lvgl.roller.update:
+          id: r_st1
+          selected_index: !lambda 'float v = id(hvac_mode).state == "cool" ? id(loc_high) : id(loc_low); return ((int) roundf(v) / 10) % 10;'
+          animated: true
+      - lvgl.roller.update:
+          id: r_st0
+          selected_index: !lambda 'float v = id(hvac_mode).state == "cool" ? id(loc_high) : id(loc_low); return (int) roundf(v) % 10;'
+          animated: true
+      - lambda: |-
+          #if LVGL_VERSION_MAJOR >= 9
+          #define TSTAT_CLR_FLAG lv_obj_remove_flag
+          #else
+          #define TSTAT_CLR_FLAG lv_obj_clear_flag
+          #endif
+          std::string m = id(hvac_mode).state;
+          bool heat = m == "heat", cool = m == "cool";
+          bool running = id(hvac_action).state == "heating" || id(hvac_action).state == "cooling";
+          uint32_t c = heat ? 0xFF7A1A : cool ? 0x4DA3FF : 0x8A8F98;
+          const char *ic = heat ? "\U000F0238" : cool ? "\U000F0717" : m == "fan_only" ? "\U000F0210" : "\U000F0425";
+          lv_label_set_text(id(st_icon), ic);
+          lv_obj_set_style_text_color(id(st_icon), lv_color_hex(c), 0);
+          lv_obj_set_style_opa(id(st_icon), (heat || cool) && !running ? LV_OPA_60 : LV_OPA_COVER, 0);
+          lv_obj_t *rs[2] = { id(r_st1)->obj, id(r_st0)->obj };
+          for (auto r : rs) {
+            lv_obj_set_style_text_color(r, lv_color_hex(c), 0);
+            lv_obj_set_style_text_color(r, lv_color_hex(c), LV_PART_SELECTED);
+          }
+          lv_obj_set_style_text_color(id(st_deg), lv_color_hex(c), 0);
+          if (heat || cool) {
+            TSTAT_CLR_FLAG(id(st_box), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(st_off), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(st_box), LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(id(st_off), m == "fan_only" ? "Fan only" : "Off");
+            TSTAT_CLR_FLAG(id(st_off), LV_OBJ_FLAG_HIDDEN);
+          }
+
+  - id: nudge
+    parameters:
+      d: int
+    then:
+      - lambda: |-
+          // heat and cool are independent now (only one runs at a time)
+          if (id(sel) == 0) id(loc_low)  = std::min(std::max(roundf(id(loc_low))  + d, 50.0f), 85.0f);
+          else              id(loc_high) = std::min(std::max(roundf(id(loc_high)) + d, 55.0f), 90.0f);
+          id(last_edit) = millis();
+      - script.execute: update_setpoints
+      - script.execute: send_setpoints
+
+  - id: send_setpoints          # waits until you stop tapping, then sends once
+    mode: restart
+    then:
+      - delay: 700ms
+      - homeassistant.action:
+          action: number.set_value
+          data:
+            entity_id: ${heat_sp}
+          data_template:
+            value: "{{ lo }}"
+          variables:
+            lo: 'return roundf(id(loc_low));'
+      - homeassistant.action:
+          action: number.set_value
+          data:
+            entity_id: ${cool_sp}
+          data_template:
+            value: "{{ hi }}"
+          variables:
+            hi: 'return roundf(id(loc_high));'
+      - lambda: 'id(last_edit) = millis();'
+
+  - id: set_mode
+    parameters:
+      mode: string
+    then:
+      - homeassistant.action:
+          action: climate.set_hvac_mode
+          data:
+            entity_id: ${thermostat}
+          data_template:
+            hvac_mode: "{{ m }}"
+          variables:
+            m: 'return mode;'
+
+  - id: toggle_fan
+    then:
+      - homeassistant.action:
+          action: climate.set_fan_mode
+          data:
+            entity_id: ${thermostat}
+          data_template:
+            fan_mode: "{{ f }}"
+          variables:
+            f: 'return id(fan_mode).state == "on" ? std::string("auto") : std::string("on");'
+
+  - id: move_sel
+    then:
+      - lambda: |-
+          lv_obj_set_x(id(sel_bar), id(sel) == 0 ? 290 : 420);
+          lv_obj_set_style_bg_color(id(sel_bar), lv_color_hex(id(sel) == 0 ? 0xFF7A1A : 0x4DA3FF), 0);
+
+  - id: update_status
+    then:
+      - lambda: |-
+          if (!wifi::global_wifi_component->is_connected()) { lv_label_set_text(id(lbl_status), "No WiFi"); return; }
+          if (api::global_api_server == nullptr || !api::global_api_server->is_connected()) {
+            lv_label_set_text(id(lbl_status), "Not connected to Home Assistant"); return; }
+          std::string m = id(hvac_mode).state, a = id(hvac_action).state, p = id(preset).state;
+          int lo = (int) roundf(id(loc_low)), hi = (int) roundf(id(loc_high));
+          char b[64];
+          if (m == "off")           snprintf(b, sizeof(b), "Off");
+          else if (a == "heating")  snprintf(b, sizeof(b), "Heating to %d°", lo);
+          else if (a == "cooling")  snprintf(b, sizeof(b), "Cooling to %d°", hi);
+          else if (m == "heat")     snprintf(b, sizeof(b), "Heat set to %d°", lo);
+          else if (m == "cool")     snprintf(b, sizeof(b), "Cool set to %d°", hi);
+          else                      snprintf(b, sizeof(b), "Keeping %d° - %d°", lo, hi);
+          std::string s(b);
+          if (p == "Away" || p == "Sleep") s += "   •   " + p;
+          lv_label_set_text(id(lbl_status), s.c_str());
+
+  - id: update_clock
+    then:
+      - if:
+          condition:
+            lambda: 'return id(ha_time).now().is_valid();'
+          then:
+            - lvgl.roller.update:
+                id: c_h1
+                selected_index: !lambda 'int h = id(ha_time).now().hour % 12; if (h == 0) h = 12; return h >= 10 ? 1 : 0;'
+                animated: true
+            - lvgl.roller.update:
+                id: c_h0
+                selected_index: !lambda 'int h = id(ha_time).now().hour % 12; if (h == 0) h = 12; return h % 10;'
+                animated: true
+            - lvgl.roller.update:
+                id: c_m1
+                selected_index: !lambda 'return id(ha_time).now().minute / 10;'
+                animated: true
+            - lvgl.roller.update:
+                id: c_m0
+                selected_index: !lambda 'return id(ha_time).now().minute % 10;'
+                animated: true
+            - lambda: |-
+                #if LVGL_VERSION_MAJOR >= 9
+                #define TSTAT_CLR_FLAG lv_obj_remove_flag
+                #else
+                #define TSTAT_CLR_FLAG lv_obj_clear_flag
+                #endif
+                auto t = id(ha_time).now();
+                int h = t.hour % 12; if (h == 0) h = 12;
+                // hide the empty tens-of-hours slot so the row re-centers itself
+                if (h >= 10) TSTAT_CLR_FLAG(id(c_h1)->obj, LV_OBJ_FLAG_HIDDEN);
+                else lv_obj_add_flag(id(c_h1)->obj, LV_OBJ_FLAG_HIDDEN);
+                std::string d = std::string(t.hour < 12 ? "AM" : "PM") + "   \u2022   " + t.strftime("%A, %B ") + std::to_string(t.day_of_month);
+                lv_label_set_text(id(clock_date), d.c_str());
+            - script.execute: apply_theme
+
+  # ---------- holiday themes ----------
+  - id: apply_theme
+    then:
+      - lambda: |-
+          #if LVGL_VERSION_MAJOR >= 9
+          #define TSTAT_CLR_FLAG lv_obj_remove_flag
+          #define TSTAT_ANIM_DEL lv_anim_delete
+          #else
+          #define TSTAT_CLR_FLAG lv_obj_clear_flag
+          #define TSTAT_ANIM_DEL lv_anim_del
+          #endif
+          auto t = id(ha_time).now();
+          if (!t.is_valid()) return;
+
+          // ---- which holiday is it? ----
+          auto dfc = [](int y, int m, int d) -> long {          // days since 1970-01-01
+            y -= m <= 2;
+            long era = (y >= 0 ? y : y - 399) / 400;
+            unsigned yoe = (unsigned) (y - era * 400);
+            unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+            unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+            return era * 146097 + (long) doe - 719468;
+          };
+          const int Y = t.year;
+          const long today = dfc(Y, t.month, t.day_of_month);
+          auto soon = [&](int m, int d) { long dd = dfc(Y, m, d) - today; return dd >= 0 && dd <= 5; };
+          // lunar-calendar holidays (main day), from published calendars
+          static const int diwali[][3] = {{2026,11,8},{2027,10,29},{2028,10,17},{2029,11,5},{2030,10,26},
+                                          {2031,11,14},{2032,11,2},{2033,10,22},{2034,11,10},{2035,10,30}};
+          static const int holi[][3]   = {{2027,3,22},{2028,3,11},{2029,3,1},{2030,3,20},{2031,3,9},
+                                          {2032,3,27},{2033,3,16},{2034,3,5},{2035,3,24}};
+          auto table = [&](const int (*tab)[3], int n) {
+            for (int i = 0; i < n; i++) if (tab[i][0] == Y) return soon(tab[i][1], tab[i][2]);
+            return false;
+          };
+          // Easter (Gregorian computus)
+          int a = Y % 19, b = Y / 100, c = Y % 100, d4 = b / 4, e = b % 4, f = (b + 8) / 25, g = (b - f + 1) / 3;
+          int h = (19 * a + b - d4 - g + 15) % 30, i4 = c / 4, k = c % 4, l = (32 + 2 * e + 2 * i4 - h - k) % 7;
+          int mm = (a + 11 * h + 22 * l) / 451;
+          int em = (h + l - 7 * mm + 114) / 31, ed = ((h + l - 7 * mm + 114) % 31) + 1;
+          // Thanksgiving: 4th Thursday of November (1970-01-01 was a Thursday)
+          int wd = (int) ((dfc(Y, 11, 1) % 7 + 7 + 4) % 7);   // 0 = Sunday
+          int tg = 1 + (4 - wd + 7) % 7 + 21;
+
+          int th = 0;
+          if (table(diwali, sizeof(diwali) / sizeof(diwali[0]))) th = 1;
+          else if (table(holi, sizeof(holi) / sizeof(holi[0]))) th = 2;
+          else if (soon(em, ed)) th = 3;
+          else if (soon(6, (Y % 4 <= 1) ? 20 : 21)) th = 4;   // June solstice (Pacific time)
+          else if (soon(10, 31)) th = 5;
+          else if (soon(11, tg)) th = 6;
+          else if (soon(12, 25)) th = 7;
+
+          // dropdown order: Auto, Off, Diwali, Holi, Easter, Summer Solstice, Halloween, Thanksgiving, Christmas
+          auto sel_idx = id(holiday_override).active_index();
+          if (sel_idx.has_value() && *sel_idx >= 1) th = (int) *sel_idx - 1;
+
+          // ---- weather effect ----
+          std::string wc = id(weather_cond).state;
+          float wt = id(weather_temp).state;
+          int wx = 0;
+          if (wc == "rainy" || wc == "pouring") wx = 1;
+          else if (wc == "lightning" || wc == "lightning-rainy") wx = 2;
+          else if (wc == "snowy" || wc == "snowy-rainy") wx = 3;
+          else if (wc == "hail") wx = 4;
+          else if (!std::isnan(wt) && wt > 78) wx = 5;
+          auto wsel = id(weather_fx_override).active_index();   // Auto, Off, Rain, Storm, Snow, Hail, Sun
+          if (wsel.has_value() && *wsel >= 1) wx = (int) *wsel - 1;
+          id(wx_now) = wx;
+
+          // ---- furnace / AC running? (0 = idle, 1 = heating, 2 = cooling) ----
+          int act = id(hvac_action).state == "heating" ? 1 : id(hvac_action).state == "cooling" ? 2 : 0;
+
+          static int cur = -1, curwx = -1, curact = -1;
+          if (th == cur && wx == curwx && act == curact) return;
+          cur = th; curwx = wx; curact = act;
+
+          // ---- theme table ----
+          static const uint32_t accent[]  = {0xFFFFFF, 0xFFB020, 0xFF4FA3, 0xC9A7FF, 0xFFC83D, 0xFF8C1A, 0xE8833A, 0xFF5A5A};
+          static const uint32_t icol[]    = {0xFFFFFF, 0xFFB020, 0xFF4FA3, 0xFFB3D9, 0xFFD60A, 0xFF8C1A, 0xC0703A, 0x34C759};
+          static const char *icon[]       = {"", "\U000F0F19", "\U000F03D8", "\U000F0AB0", "\U000F0599", "\U000F0BA3", "\U000F171B", "\U000F0405"};
+          static const char *greet[]      = {"", "Happy Diwali", "Happy Holi", "Happy Easter", "Happy Summer Solstice",
+                                             "Happy Halloween", "Happy Thanksgiving", "Merry Christmas"};
+          // particles: glyph ("" = round dots), direction, colors
+          static const char *pglyph[]     = {"", "", "", "\U000F024A", "\U000F0AE2", "\U000F0B5F", "\U000F0C93", "\U000F0717"};
+          static const bool up[]          = {false, true, true, false, true, true, false, false};
+          static const uint32_t pcol[][4] = {{0,0,0,0},
+            {0xFFD60A, 0xFFB020, 0xFF7A1A, 0xFFE58A},     // Diwali sparks
+            {0xFF4FA3, 0xFFD60A, 0x34C759, 0x4DA3FF},     // Holi colors
+            {0xFFB3D9, 0xB3E5FF, 0xFFF3A3, 0xC9A7FF},     // Easter flowers
+            {0xFFD60A, 0xFFC83D, 0xFFF3A3, 0xFFE58A},     // solstice sparkles
+            {0xFF8C1A, 0x9B6BFF, 0x8A8F98, 0x9B6BFF},     // Halloween bats
+            {0xD9480F, 0xF08C00, 0xFFD43B, 0xA0522D},     // Thanksgiving leaves
+            {0xFFFFFF, 0xCFE8FF, 0xFFFFFF, 0xB3D9FF}};    // Christmas snow
+
+          // ---- clock + greeting colors ----
+          lv_color_t ac = lv_color_hex(accent[th]);
+          lv_obj_t *dig[4] = { id(c_h1)->obj, id(c_h0)->obj, id(c_m1)->obj, id(c_m0)->obj };
+          for (auto o : dig) { lv_obj_set_style_text_color(o, ac, 0); lv_obj_set_style_text_color(o, ac, LV_PART_SELECTED); }
+          lv_obj_set_style_text_color(id(clock_colon), ac, 0);
+          // faint background tint for the theme
+          lv_obj_t *pg_obj = id(clock_page)->obj;
+          static const uint32_t wtint[] = {0x000000, 0x0B1A2E, 0x14102A, 0x1A2230, 0x16202A, 0x2A1A06};
+          lv_color_t tint = th != 0 ? lv_color_mix(ac, lv_color_hex(0x000000), 46) : lv_color_hex(wtint[wx]);
+          if (act == 1) tint = lv_color_hex(0x7A2600);          // heating: deep ember orange
+          if (act == 2) tint = lv_color_hex(0x003A78);          // cooling: deep ice blue
+          bool tinted = th != 0 || wx != 0 || act != 0;
+          lv_obj_set_style_bg_color(pg_obj, lv_color_hex(0x000000), 0);
+          lv_obj_set_style_bg_grad_color(pg_obj, tint, 0);
+          lv_obj_set_style_bg_grad_dir(pg_obj, tinted ? LV_GRAD_DIR_VER : LV_GRAD_DIR_NONE, 0);
+          // living gradient: drifts up/down, shifts tone and breathes slightly.
+          // Updates in small steps (~3 per second) so it stays light on the display.
+          static lv_color_t g_a, g_b;
+          static const uint32_t walt[] = {0x000000, 0x081A24, 0x1E0E2E, 0x101C2E, 0x0E1A26, 0x2E1206};
+          static bool g_act;
+          g_act = act != 0;
+          g_a = tint;
+          g_b = th != 0 ? lv_color_mix(lv_color_hex(icol[th]), lv_color_hex(0x000000), 40) : lv_color_hex(walt[wx]);
+          if (act == 1) g_b = lv_color_hex(0xB23A00);           // flickers toward bright orange-red
+          if (act == 2) g_b = lv_color_hex(0x0A6FB0);           // shimmers toward bright cyan-blue
+          TSTAT_ANIM_DEL(pg_obj, NULL);
+          lv_obj_set_style_bg_main_stop(pg_obj, 0, 0);
+          if (tinted) {
+            lv_anim_t ga;
+            lv_anim_init(&ga);
+            lv_anim_set_var(&ga, pg_obj);
+            lv_anim_set_exec_cb(&ga, [](void *o, int32_t v) {
+              static int last = -1;
+              int f = v > 1000 ? 2000 - v : v;            // 0 -> 1000 -> 0
+              int q = f / 33;                              // ~30 steps each way
+              if (q == last) return;
+              last = q;
+              uint8_t k = (uint8_t) (q * 255 / 30);
+              lv_color_t c = lv_color_mix(g_b, g_a, k);
+              if (g_act) {
+                // running: strong breathing glow that climbs high up the screen
+                c = lv_color_mix(c, lv_color_hex(0x000000), (uint8_t) (150 + q * 105 / 30));
+                lv_obj_set_style_bg_grad_color((lv_obj_t *) o, c, 0);
+                lv_obj_set_style_bg_main_stop((lv_obj_t *) o, q * 4, 0);
+              } else {
+                c = lv_color_mix(c, lv_color_hex(0x000000), (uint8_t) (200 + q * 55 / 30));   // gentle breathing
+                lv_obj_set_style_bg_grad_color((lv_obj_t *) o, c, 0);
+                lv_obj_set_style_bg_main_stop((lv_obj_t *) o, 20 + q * 3, 0);             // glow moves up/down
+              }
+            });
+            lv_anim_set_values(&ga, 0, 2000);
+          #if LVGL_VERSION_MAJOR >= 9
+            lv_anim_set_duration(&ga, act ? 7000 : 20000);
+          #else
+            lv_anim_set_time(&ga, act ? 7000 : 20000);
+          #endif
+            lv_anim_set_repeat_count(&ga, LV_ANIM_REPEAT_INFINITE);
+            lv_anim_start(&ga);
+          }
+          if (th == 0) {
+            lv_obj_add_flag(id(hol_row), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_label_set_text(id(hol_icon), icon[th]);
+            lv_obj_set_style_text_color(id(hol_icon), lv_color_hex(icol[th]), 0);
+            lv_label_set_text(id(hol_lbl), greet[th]);
+            lv_obj_set_style_text_color(id(hol_lbl), ac, 0);
+            TSTAT_CLR_FLAG(id(hol_row), LV_OBJ_FLAG_HIDDEN);
+          }
+
+          // ---- particles (smooth LVGL animations, behind the text) ----
+          lv_obj_t *pg[12] = { id(pg0), id(pg1), id(pg2), id(pg3), id(pg4), id(pg5),
+                               id(pg6), id(pg7), id(pg8), id(pg9), id(pg10), id(pg11) };
+          lv_obj_t *pd[12] = { id(pd0), id(pd1), id(pd2), id(pd3), id(pd4), id(pd5),
+                               id(pd6), id(pd7), id(pd8), id(pd9), id(pd10), id(pd11) };
+          lv_obj_t *pr[20] = { id(pr0), id(pr1), id(pr2), id(pr3), id(pr4), id(pr5), id(pr6), id(pr7), id(pr8), id(pr9),
+                               id(pr10), id(pr11), id(pr12), id(pr13), id(pr14), id(pr15), id(pr16), id(pr17), id(pr18), id(pr19) };
+          for (int n = 0; n < 12; n++) {
+            TSTAT_ANIM_DEL(pg[n], NULL); TSTAT_ANIM_DEL(pd[n], NULL);
+            lv_obj_add_flag(pg[n], LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(pd[n], LV_OBJ_FLAG_HIDDEN);
+          }
+          for (int n = 0; n < 20; n++) { TSTAT_ANIM_DEL(pr[n], NULL); lv_obj_add_flag(pr[n], LV_OBJ_FLAG_HIDDEN); }
+
+          // ---- heat / cool particles: embers rise while heating, cool air streaks drift while cooling ----
+          lv_obj_t *hv[12] = { id(hv0), id(hv1), id(hv2), id(hv3), id(hv4), id(hv5),
+                               id(hv6), id(hv7), id(hv8), id(hv9), id(hv10), id(hv11) };
+          for (int n = 0; n < 12; n++) { TSTAT_ANIM_DEL(hv[n], NULL); lv_obj_add_flag(hv[n], LV_OBJ_FLAG_HIDDEN); }
+          if (act != 0) {
+            static const uint32_t hcol[] = {0xFF7A1A, 0xFFB020, 0xFF4A1A, 0xFFD27A};
+            static const uint32_t ccol[] = {0x7FD4FF, 0x4DA3FF, 0xBFE9FF, 0x9FC4FF};
+            for (int n = 0; n < 12; n++) {
+              lv_obj_t *o = hv[n];
+              bool heat = act == 1;
+              int sz = 4 + (int) (random_uint32() % 5);
+              lv_obj_set_size(o, heat ? sz : 40 + (int) (random_uint32() % 50), heat ? sz : 2);
+              lv_obj_set_style_radius(o, heat ? LV_RADIUS_CIRCLE : 1, 0);
+              lv_obj_set_style_bg_color(o, lv_color_hex(heat ? hcol[n % 4] : ccol[n % 4]), 0);
+              lv_obj_set_style_opa(o, LV_OPA_TRANSP, 0);
+              uint32_t dur = heat ? 4500 + random_uint32() % 3500 : 5000 + random_uint32() % 4000;
+              uint32_t dly = random_uint32() % dur;
+              // movement: embers rise from the bottom, cool air slides across the lower half
+              int a0, a1;
+              if (heat) { lv_obj_set_x(o, 10 + (int) (random_uint32() % 780)); a0 = 490; a1 = 160 + (int) (random_uint32() % 120); }
+              else      { lv_obj_set_y(o, 230 + (int) (random_uint32() % 240)); a0 = -100; a1 = 860; }
+              TSTAT_CLR_FLAG(o, LV_OBJ_FLAG_HIDDEN);
+              lv_anim_t m;
+              lv_anim_init(&m);
+              lv_anim_set_var(&m, o);
+              if (heat) lv_anim_set_exec_cb(&m, [](void *v, int32_t y) { lv_obj_set_y((lv_obj_t *) v, y); });
+              else      lv_anim_set_exec_cb(&m, [](void *v, int32_t x) { lv_obj_set_x((lv_obj_t *) v, x); });
+              lv_anim_set_values(&m, a0, a1);
+              // fade in, then out, over the same time so each particle glows and disappears
+              lv_anim_t f;
+              lv_anim_init(&f);
+              lv_anim_set_var(&f, o);
+              lv_anim_set_exec_cb(&f, [](void *v, int32_t k) {
+                int t = k <= 100 ? k : 200 - k;                     // 0 -> 100 -> 0
+                lv_obj_set_style_opa((lv_obj_t *) v, (lv_opa_t) (t * 230 / 100), 0);
+              });
+              lv_anim_set_values(&f, 0, 200);
+              for (lv_anim_t *x : { &m, &f }) {
+              #if LVGL_VERSION_MAJOR >= 9
+                lv_anim_set_duration(x, dur);
+              #else
+                lv_anim_set_time(x, dur);
+              #endif
+                lv_anim_set_delay(x, dly);
+                lv_anim_set_repeat_count(x, LV_ANIM_REPEAT_INFINITE);
+                lv_anim_start(x);
+              }
+            }
+          }
+
+          // weather particles: rain / storm / snow / hail always show; hot-sun glow only when no holiday
+          if (wx >= 1 && wx <= 4 || (wx == 5 && th == 0)) {
+            //                    none  rain   storm  snow   hail   sun
+            static const int cnt[]  = {0, 14,    16,    14,    14,    10};
+            static const int w_[]   = {0, 2,     2,     6,     6,     5};
+            static const int h_[]   = {0, 26,    30,    6,     6,     5};
+            static const uint32_t dmin[] = {0, 1100, 900, 6000, 1300, 9000};
+            static const uint32_t dvar[] = {0, 500, 400, 5000, 600, 6000};
+            static const uint32_t col[]  = {0, 0x7FB8FF, 0x9FC4FF, 0xFFFFFF, 0xE8F4FF, 0xFFE58A};
+            for (int n = 0; n < cnt[wx]; n++) {
+              lv_obj_t *o = pr[n];
+              lv_obj_set_size(o, w_[wx], h_[wx]);
+              lv_obj_set_style_radius(o, (wx >= 3) ? LV_RADIUS_CIRCLE : 1, 0);
+              lv_obj_set_style_bg_color(o, lv_color_hex(col[wx]), 0);
+              lv_obj_set_style_opa(o, (lv_opa_t) ((wx == 5 ? 80 : 120) + random_uint32() % 100), 0);
+              bool rise = wx == 5;
+              int y0 = rise ? 520 : -140, y1 = rise ? -60 : 520;
+              uint32_t dur = dmin[wx] + random_uint32() % dvar[wx];
+              lv_obj_set_pos(o, 6 + (int) (random_uint32() % 788), y0);
+              TSTAT_CLR_FLAG(o, LV_OBJ_FLAG_HIDDEN);
+              lv_anim_t an;
+              lv_anim_init(&an);
+              lv_anim_set_var(&an, o);
+              lv_anim_set_exec_cb(&an, [](void *v, int32_t y) { lv_obj_set_y((lv_obj_t *) v, y); });
+              lv_anim_set_values(&an, y0, y1);
+            #if LVGL_VERSION_MAJOR >= 9
+              lv_anim_set_duration(&an, dur);
+            #else
+              lv_anim_set_time(&an, dur);
+            #endif
+              lv_anim_set_delay(&an, random_uint32() % dur);
+              lv_anim_set_repeat_count(&an, LV_ANIM_REPEAT_INFINITE);
+              lv_anim_start(&an);
+            }
+            if (wx != 5) return;          // precipitation replaces the holiday particles
+          }
+          if (th == 0) return;
+          bool glyph = pglyph[th][0] != 0;
+          for (int n = 0; n < 12; n++) {
+            lv_obj_t *o = glyph ? pg[n] : pd[n];
+            uint32_t col = pcol[th][n % 4];
+            if (glyph) { lv_label_set_text(o, pglyph[th]); lv_obj_set_style_text_color(o, lv_color_hex(col), 0); }
+            else       { lv_obj_set_style_bg_color(o, lv_color_hex(col), 0); }
+            lv_obj_set_style_opa(o, (lv_opa_t) (140 + random_uint32() % 100), 0);
+            int x = 10 + (int) (random_uint32() % 760);
+            int y0 = up[th] ? 500 : -40, y1 = up[th] ? -40 : 500;
+            uint32_t dur = 9000 + random_uint32() % 8000;
+            lv_obj_set_pos(o, x, y0);
+            TSTAT_CLR_FLAG(o, LV_OBJ_FLAG_HIDDEN);
+            lv_anim_t an;
+            lv_anim_init(&an);
+            lv_anim_set_var(&an, o);
+            lv_anim_set_exec_cb(&an, [](void *v, int32_t y) { lv_obj_set_y((lv_obj_t *) v, y); });
+            lv_anim_set_values(&an, y0, y1);
+          #if LVGL_VERSION_MAJOR >= 9
+            lv_anim_set_duration(&an, dur);
+          #else
+            lv_anim_set_time(&an, dur);
+          #endif
+            lv_anim_set_delay(&an, random_uint32() % dur);
+            lv_anim_set_repeat_count(&an, LV_ANIM_REPEAT_INFINITE);
+            lv_anim_start(&an);
+          }
+
+  - id: filter_reset_go
+    mode: single
+    then:
+      - homeassistant.action:
+          action: button.press
+          data:
+            entity_id: ${filter_reset}
+      - lvgl.label.update: { id: lbl_filter_btn, text: "Filter reset!" }
+      - delay: 2s
+      - lambda: 'lv_obj_set_width(id(filter_fill), 0);'
+      - lvgl.label.update: { id: lbl_filter_btn, text: "Hold: new filter put in" }
+
+  # ---------- 7-day forecast page ----------
+  # days attr: "Mon|rainy|64|51|0.12|40;..."  (day, condition, high, low, rain inches, chance % or -1)
+  # h0..h6 attr: "6|63|0.00|10;7|62|0.02|30;..." (hour, temp, rain inches, chance % or -1)
+  - id: refresh_fc
+    then:
+      - lambda: |-
+          #if LVGL_VERSION_MAJOR >= 9
+          #define TSTAT_CLR_FLAG lv_obj_remove_flag
+          #else
+          #define TSTAT_CLR_FLAG lv_obj_clear_flag
+          #endif
+          auto split = [](const std::string &s, char d) {
+            std::vector<std::string> v; size_t p = 0;
+            while (p <= s.size()) { size_t q = s.find(d, p); v.push_back(s.substr(p, q == std::string::npos ? std::string::npos : q - p)); if (q == std::string::npos) break; p = q + 1; }
+            return v;
+          };
+          auto wx = [](const std::string &c, uint32_t &col) -> const char * {
+            col = 0xCFCFCF;
+            if (c == "sunny") { col = 0xFFD60A; return "\U000F0599"; }
+            if (c == "clear-night") { col = 0xB8C4FF; return "\U000F0594"; }
+            if (c == "partlycloudy") { col = 0xFFE58A; return "\U000F0595"; }
+            if (c == "rainy") { col = 0x4DA3FF; return "\U000F0597"; }
+            if (c == "pouring") { col = 0x4DA3FF; return "\U000F0596"; }
+            if (c == "snowy" || c == "snowy-rainy") { col = 0xFFFFFF; return "\U000F0598"; }
+            if (c == "fog") { col = 0xAEB4BC; return "\U000F0591"; }
+            if (c == "lightning" || c == "lightning-rainy") { col = 0xBF5AF2; return "\U000F0593"; }
+            if (c == "windy" || c == "windy-variant") return "\U000F059D";
+            if (c == "hail") { col = 0xFFFFFF; return "\U000F0592"; }
+            if (c == "exceptional") { col = 0xFF9F0A; return "\U000F0F2F"; }
+            return "\U000F0590";
+          };
+          auto nice = [](const std::string &c) -> const char * {
+            if (c == "sunny") return "Sunny"; if (c == "clear-night") return "Clear"; if (c == "partlycloudy") return "Partly cloudy";
+            if (c == "rainy") return "Rain"; if (c == "pouring") return "Heavy rain"; if (c == "snowy" || c == "snowy-rainy") return "Snow";
+            if (c == "fog") return "Fog"; if (c == "lightning" || c == "lightning-rainy") return "Storms"; if (c == "hail") return "Hail";
+            if (c == "windy" || c == "windy-variant") return "Windy"; return "Cloudy";
+          };
+          static const char *full[] = {"Sun", "Sunday", "Mon", "Monday", "Tue", "Tuesday", "Wed", "Wednesday", "Thu", "Thursday", "Fri", "Friday", "Sat", "Saturday"};
+          lv_obj_t *tb[7] = { id(fct0), id(fct1), id(fct2), id(fct3), id(fct4), id(fct5), id(fct6) };
+          lv_obj_t *td[7] = { id(fcd_0), id(fcd_1), id(fcd_2), id(fcd_3), id(fcd_4), id(fcd_5), id(fcd_6) };
+          lv_obj_t *ti[7] = { id(fci_0), id(fci_1), id(fci_2), id(fci_3), id(fci_4), id(fci_5), id(fci_6) };
+          lv_obj_t *th[7] = { id(fch_0), id(fch_1), id(fch_2), id(fch_3), id(fch_4), id(fch_5), id(fch_6) };
+          lv_obj_t *tl[7] = { id(fcl_0), id(fcl_1), id(fcl_2), id(fcl_3), id(fcl_4), id(fcl_5), id(fcl_6) };
+          lv_obj_t *tr[7] = { id(fcr_0), id(fcr_1), id(fcr_2), id(fcr_3), id(fcr_4), id(fcr_5), id(fcr_6) };
+          auto days = split(id(fc7_days).state, ';');
+          int sel = std::min(std::max(id(fc_sel), 0), 6);
+          std::vector<std::string> sd;
+          char b[64];
+          for (int i = 0; i < 7; i++) {
+            std::vector<std::string> f = (i < (int) days.size() && !days[i].empty()) ? split(days[i], '|') : std::vector<std::string>();
+            bool ok = f.size() >= 4;
+            uint32_t col; const char *g = wx(ok ? f[1] : "", col);
+            lv_label_set_text(td[i], ok ? (i == 0 ? "Today" : f[0].c_str()) : "");
+            lv_label_set_text(ti[i], ok ? g : "");
+            lv_obj_set_style_text_color(ti[i], lv_color_hex(col), 0);
+            lv_label_set_text(th[i], ok ? (f[2] + "°").c_str() : "");
+            lv_label_set_text(tl[i], ok ? (f[3] + "°").c_str() : "");
+            std::string rain = "";
+            if (f.size() >= 6) {
+              int pc = atoi(f[5].c_str()); float in = atof(f[4].c_str());
+              if (pc >= 0) { snprintf(b, sizeof(b), "%d%%", pc); rain = b; }
+              else if (in > 0.005f) { snprintf(b, sizeof(b), "%.2f\"", in); rain = b; }
+            }
+            lv_label_set_text(tr[i], rain.c_str());
+            lv_obj_set_style_bg_color(tb[i], lv_color_hex(i == sel ? 0x2A2A2A : 0x111111), 0);
+            lv_obj_set_style_border_width(tb[i], i == sel ? 2 : 0, 0);
+            if (i == sel) sd = f;
+          }
+          // ---- detail panel for the selected day ----
+          if (sd.size() < 4) {
+            lv_label_set_text(id(fcx_title), "Forecast not loaded yet");
+            lv_label_set_text(id(fcx_stats), "Check sensor.display_forecast_7_day in Home Assistant");
+          } else {
+            const char *dn = sd[0].c_str();
+            for (int k = 0; k < 14; k += 2) if (sd[0] == full[k]) dn = full[k + 1];
+            snprintf(b, sizeof(b), "%s%s  -  %s", sel == 0 ? "Today, " : "", dn, nice(sd[1]));
+            lv_label_set_text(id(fcx_title), b);
+            std::string st = "High " + sd[2] + "°     Low " + sd[3] + "°";
+            if (sd.size() >= 6) {
+              float in = atof(sd[4].c_str()); int pc = atoi(sd[5].c_str());
+              snprintf(b, sizeof(b), "     Rain %.2f in", in); st += b;
+              if (pc >= 0) { snprintf(b, sizeof(b), "  (%d%% chance)", pc); st += b; }
+            }
+            lv_label_set_text(id(fcx_stats), st.c_str());
+          }
+          // hourly chart: temperature dots (white) + rain bars (blue)
+          text_sensor::TextSensor *hs[7] = { id(fh0), id(fh1), id(fh2), id(fh3), id(fh4), id(fh5), id(fh6) };
+          auto pts = split(hs[sel]->state, ';');
+          std::vector<int> hr; std::vector<float> tp, rn;
+          for (auto &p : pts) { auto f = split(p, '|'); if (f.size() >= 3) { hr.push_back(atoi(f[0].c_str())); tp.push_back(atof(f[1].c_str())); rn.push_back(atof(f[2].c_str())); } }
+          lv_obj_t *dot[24] = { id(fx_d0), id(fx_d1), id(fx_d2), id(fx_d3), id(fx_d4), id(fx_d5), id(fx_d6), id(fx_d7), id(fx_d8), id(fx_d9), id(fx_d10), id(fx_d11),
+                                id(fx_d12), id(fx_d13), id(fx_d14), id(fx_d15), id(fx_d16), id(fx_d17), id(fx_d18), id(fx_d19), id(fx_d20), id(fx_d21), id(fx_d22), id(fx_d23) };
+          lv_obj_t *bar[24] = { id(fx_b0), id(fx_b1), id(fx_b2), id(fx_b3), id(fx_b4), id(fx_b5), id(fx_b6), id(fx_b7), id(fx_b8), id(fx_b9), id(fx_b10), id(fx_b11),
+                                id(fx_b12), id(fx_b13), id(fx_b14), id(fx_b15), id(fx_b16), id(fx_b17), id(fx_b18), id(fx_b19), id(fx_b20), id(fx_b21), id(fx_b22), id(fx_b23) };
+          lv_obj_t *hl[6] = { id(fx_h0), id(fx_h1), id(fx_h2), id(fx_h3), id(fx_h4), id(fx_h5) };
+          int n = std::min((int) hr.size(), 24);
+          const int X0 = 60, W = 700, TOP = 336, BOT = 452;   // chart area on screen
+          if (n == 0) {
+            for (int i = 0; i < 24; i++) { lv_obj_add_flag(dot[i], LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(bar[i], LV_OBJ_FLAG_HIDDEN); }
+            for (int i = 0; i < 6; i++) lv_label_set_text(hl[i], "");
+            lv_label_set_text(id(fx_note), "Hour-by-hour details only go about 2-3 days ahead");
+            lv_label_set_text(id(fx_tmax), ""); lv_label_set_text(id(fx_tmin), "");
+          } else {
+            lv_label_set_text(id(fx_note), "");
+            float tmn = 999, tmx = -999, rmx = 0.1f;
+            for (int i = 0; i < n; i++) { tmn = std::min(tmn, tp[i]); tmx = std::max(tmx, tp[i]); rmx = std::max(rmx, rn[i]); }
+            if (tmx - tmn < 4) { tmx += 2; tmn -= 2; }
+            float step = (float) W / n;
+            for (int i = 0; i < 24; i++) {
+              if (i >= n) { lv_obj_add_flag(dot[i], LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(bar[i], LV_OBJ_FLAG_HIDDEN); continue; }
+              int x = X0 + (int) (i * step + step / 2);
+              int y = TOP + (int) ((tmx - tp[i]) / (tmx - tmn) * (BOT - TOP - 10));
+              lv_obj_set_pos(dot[i], x - 5, y - 5);
+              TSTAT_CLR_FLAG(dot[i], LV_OBJ_FLAG_HIDDEN);
+              int bh = (int) (rn[i] / rmx * 60);
+              if (rn[i] > 0.001f) {
+                int bw = std::max(4, (int) (step * 0.6f));
+                lv_obj_set_size(bar[i], bw, std::max(bh, 3));
+                lv_obj_set_pos(bar[i], x - bw / 2, BOT - std::max(bh, 3));
+                TSTAT_CLR_FLAG(bar[i], LV_OBJ_FLAG_HIDDEN);
+              } else lv_obj_add_flag(bar[i], LV_OBJ_FLAG_HIDDEN);
+            }
+            snprintf(b, sizeof(b), "%.0f°", tmx); lv_label_set_text(id(fx_tmax), b);
+            snprintf(b, sizeof(b), "%.0f°", tmn); lv_label_set_text(id(fx_tmin), b);
+            for (int k = 0; k < 6; k++) {
+              int i = k * (n - 1) / 5;
+              int h = hr[i] % 12; if (h == 0) h = 12;
+              snprintf(b, sizeof(b), "%d%s", h, hr[i] < 12 ? "am" : "pm");
+              lv_label_set_text(hl[k], b);
+              lv_obj_set_x(hl[k], X0 + (int) (i * step + step / 2) - 30);
+            }
+          }
+
+  # ---------- energy page ----------
+  - id: refresh_energy
+    then:
+      - lambda: |-
+          char b[80];
+          auto money = [&](lv_obj_t *l, float v) { if (std::isnan(v)) lv_label_set_text(l, "--"); else { snprintf(b, sizeof(b), "$%.2f", v); lv_label_set_text(l, b); } };
+          auto split = [&](lv_obj_t *l, float h, float c) {
+            snprintf(b, sizeof(b), "Heat $%.2f  |  AC $%.2f", std::isnan(h) ? 0.0f : h, std::isnan(c) ? 0.0f : c);
+            lv_label_set_text(l, b);
+          };
+          auto sum = [](float a, float c) { if (std::isnan(a) && std::isnan(c)) return NAN; return (std::isnan(a) ? 0 : a) + (std::isnan(c) ? 0 : c); };
+          money(id(en_d), sum(id(cost_d).state, id(cc_d).state)); split(id(en_ds), id(cost_d).state, id(cc_d).state);
+          money(id(en_w), sum(id(cost_w).state, id(cc_w).state)); split(id(en_ws), id(cost_w).state, id(cc_w).state);
+          money(id(en_m), sum(id(cost_m).state, id(cc_m).state)); split(id(en_ms), id(cost_m).state, id(cc_m).state);
+          money(id(en_l), id(cost_last).state);
+          // projection for the whole month
+          auto t = id(ha_time).now();
+          float mtd = sum(id(cost_m).state, id(cc_m).state), last = id(cost_last).state;
+          if (t.is_valid() && !std::isnan(mtd) && t.day_of_month >= 2) {
+            static const int dim[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+            int days = dim[t.month - 1] + ((t.month == 2 && t.year % 4 == 0) ? 1 : 0);
+            float proj = mtd / t.day_of_month * days;
+            if (!std::isnan(last) && last > 0.5f) {
+              float pct = (proj - last) / last * 100.0f;
+              snprintf(b, sizeof(b), "On track for about $%.0f this month - %.0f%% %s than last month", proj, fabsf(pct), pct >= 0 ? "more" : "less");
+            } else snprintf(b, sizeof(b), "On track for about $%.0f this month", proj);
+          } else snprintf(b, sizeof(b), "The monthly estimate shows up after the 1st day of the month");
+          lv_label_set_text(id(en_proj), b);
+
+          // whole house electric bill (PG&E)
+          float hc = id(house_cost).state, hf = id(house_fcst).state, ht = id(house_typ).state;
+          money(id(hs_cost), hc); money(id(hs_fcst), hf); money(id(hs_typ), ht);
+          if (!std::isnan(hf) && !std::isnan(ht) && ht > 0.5f) {
+            float pct = (hf - ht) / ht * 100.0f;
+            snprintf(b, sizeof(b), "%s%.0f%%", pct >= 0 ? "+" : "-", fabsf(pct));
+            lv_label_set_text(id(hs_vs), b);
+            lv_obj_set_style_text_color(id(hs_vs), lv_color_hex(pct > 5 ? 0xFF7A1A : pct < -5 ? 0x34C759 : 0xFFFFFF), 0);
+          } else lv_label_set_text(id(hs_vs), "--");
+
+          // 7-day bars: 6 past days from HA + today live
+          float hv[7] = {0}, cv[7] = {0};
+          auto parse = [](const std::string &s, float *out) {
+            float tmp[6]; int n = 0; size_t p = 0;
+            while (p < s.size() && n < 6) { size_t q = s.find(',', p); tmp[n++] = atof(s.substr(p, q == std::string::npos ? std::string::npos : q - p).c_str()); if (q == std::string::npos) break; p = q + 1; }
+            for (int i = 0; i < n; i++) out[6 - n + i] = tmp[i];
+          };
+          parse(id(hist_heat).state, hv); parse(id(hist_cool).state, cv);
+          hv[6] = std::isnan(id(hh_today).state) ? 0 : id(hh_today).state;
+          cv[6] = std::isnan(id(ch_today).state) ? 0 : id(ch_today).state;
+          float mx = 1.0f;
+          for (int i = 0; i < 7; i++) mx = std::max(mx, hv[i] + cv[i]);
+          lv_obj_t *hb[7] = { id(eh0), id(eh1), id(eh2), id(eh3), id(eh4), id(eh5), id(eh6) };
+          lv_obj_t *cb[7] = { id(ec0), id(ec1), id(ec2), id(ec3), id(ec4), id(ec5), id(ec6) };
+          lv_obj_t *vl[7] = { id(ev0), id(ev1), id(ev2), id(ev3), id(ev4), id(ev5), id(ev6) };
+          lv_obj_t *dl[7] = { id(ed0), id(ed1), id(ed2), id(ed3), id(ed4), id(ed5), id(ed6) };
+          static const char *wd[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+          const int base = 432, H = 104;
+          for (int i = 0; i < 7; i++) {
+            int hh = (int) (hv[i] / mx * H), ch = (int) (cv[i] / mx * H);
+            lv_obj_set_height(hb[i], std::max(hh, 2)); lv_obj_set_y(hb[i], base - std::max(hh, 2));
+            lv_obj_set_height(cb[i], std::max(ch, 2)); lv_obj_set_y(cb[i], base - std::max(hh, 2) - std::max(ch, 2));
+            snprintf(b, sizeof(b), "%.1fh", hv[i] + cv[i]);
+            lv_label_set_text(vl[i], b);
+            lv_obj_set_y(vl[i], base - std::max(hh, 2) - std::max(ch, 2) - 24);
+            if (i == 6) lv_label_set_text(dl[i], "Today");
+            else if (t.is_valid()) lv_label_set_text(dl[i], wd[((t.day_of_week - 1) - (6 - i) + 14) % 7]);
+          }
+
+  # ---------- network page ----------
+  - id: refresh_net
+    then:
+      - lambda: |-
+          char b[64];
+          bool w = wifi::global_wifi_component->is_connected();
+          bool a = api::global_api_server != nullptr && api::global_api_server->is_connected();
+          lv_label_set_text(id(net_name), w ? id(net_ssid).state.c_str() : "Not connected");
+          float r = id(wifi_rssi).state;
+          const char *q = std::isnan(r) || !w ? "--" : r > -55 ? "Excellent" : r > -67 ? "Good" : r > -75 ? "Fair" : "Weak";
+          uint32_t qc = std::isnan(r) || !w ? 0x8A8F98 : r > -67 ? 0x34C759 : r > -75 ? 0xFF9F0A : 0xFF453A;
+          if (w && !std::isnan(r)) snprintf(b, sizeof(b), "%s  (%.0f dBm)", q, r); else snprintf(b, sizeof(b), "--");
+          lv_label_set_text(id(net_sig), b);
+          lv_obj_set_style_text_color(id(net_sig), lv_color_hex(qc), 0);
+          lv_label_set_text(id(net_ipl), w ? id(net_ip).state.c_str() : "--");
+          lv_label_set_text(id(net_ha), a ? "Connected" : "Not connected");
+          lv_obj_set_style_text_color(id(net_ha), lv_color_hex(a ? 0x34C759 : 0xFF453A), 0);
+          uint32_t up = millis() / 60000;
+          snprintf(b, sizeof(b), "%ud %uh %um", (unsigned) (up / 1440), (unsigned) (up / 60 % 24), (unsigned) (up % 60));
+          lv_label_set_text(id(net_up), b);
+          float d = id(spd_down).state, u = id(spd_up).state, pg = id(spd_ping).state;
+          if (std::isnan(d)) lv_label_set_text(id(net_down), "--"); else { snprintf(b, sizeof(b), "%.0f", d); lv_label_set_text(id(net_down), b); }
+          if (std::isnan(u)) lv_label_set_text(id(net_upl), "--"); else { snprintf(b, sizeof(b), "%.0f", u); lv_label_set_text(id(net_upl), b); }
+          if (std::isnan(pg)) lv_label_set_text(id(net_ping), "--"); else { snprintf(b, sizeof(b), "%.0f", pg); lv_label_set_text(id(net_ping), b); }
+          const char *inet = !a ? "Can't check - Home Assistant not connected"
+                           : std::isnan(d) ? "No speed test yet - add Speedtest.net in Home Assistant"
+                           : "Internet is working";
+          if (id(spd_testing) && millis() - id(spd_testing) < 90000) inet = "Testing... (takes about 30 seconds)";
+          lv_label_set_text(id(net_inet), inet);
+
+  # ---------- settings page ----------
+  - id: refresh_settings
+    then:
+      - lambda: |-
+          #if LVGL_VERSION_MAJOR >= 9
+          #define TSTAT_CLR_FLAG lv_obj_remove_flag
+          #else
+          #define TSTAT_CLR_FLAG lv_obj_clear_flag
+          #endif
+          auto seg = [](lv_obj_t *b, bool on) { lv_obj_set_style_bg_color(b, lv_color_hex(on ? 0x3A3A3A : 0x161616), 0); };
+          std::string src = id(src_state).state;
+          seg(id(btn_src0), src == "Wall sensor"); seg(id(btn_src1), src == "Average"); seg(id(btn_src2), src == "Govee room");
+          std::string p = id(preset).state;
+          seg(id(btn_pr0), p == "Home"); seg(id(btn_pr1), p == "Away"); seg(id(btn_pr2), p == "Sleep");
+          bool on = id(pre_sw).state == "on";
+          lv_obj_set_style_bg_color(id(btn_pre), lv_color_hex(on ? 0xFF7A1A : 0x161616), 0);
+          lv_label_set_text(id(lbl_pre_on), on ? "On" : "Off");
+          lv_label_set_text(id(lbl_pre_status), on ? id(pre_status_ha).state.c_str() : "Heats early so it's warm by your wake-up time");
+          char b[64];
+          int m = id(st_pre_min); int h = m / 60 % 12; if (h == 0) h = 12;
+          snprintf(b, sizeof(b), "%d:%02d %s", h, m % 60, m / 60 < 12 ? "AM" : "PM"); lv_label_set_text(id(lbl_pre_time), b);
+          snprintf(b, sizeof(b), "%.0f°", id(st_pre_temp)); lv_label_set_text(id(lbl_pre_temp), b);
+          snprintf(b, sizeof(b), "%d min", id(st_fan)); lv_label_set_text(id(lbl_fan), b);
+          static const char *thn[] = {"Auto", "Off", "Diwali", "Holi", "Easter", "Summer Solstice", "Halloween", "Thanksgiving", "Christmas"};
+          auto ix = id(holiday_override).active_index();
+          std::string tt = std::string("Theme: ") + thn[(ix.has_value() && *ix < 9) ? *ix : 0];
+          lv_label_set_text(id(lbl_theme), tt.c_str());
+          float r = id(rate_ha).state;
+          if (std::isnan(r)) snprintf(b, sizeof(b), "Warm-up speed: learning...");
+          else snprintf(b, sizeof(b), "Warm-up speed: %.1f° per hour", r);
+          lv_label_set_text(id(lbl_rate), b);
+          // air filter
+          float fp = id(filter_pct).state;
+          bool flow = !std::isnan(fp) && fp <= 10;
+          if (std::isnan(fp)) snprintf(b, sizeof(b), "--"); else snprintf(b, sizeof(b), "%.0f%% left", fp);
+          lv_label_set_text(id(lbl_filter), b);
+          lv_obj_set_style_text_color(id(lbl_filter), lv_color_hex(std::isnan(fp) ? 0x8A8F98 : fp <= 10 ? 0xFF453A : fp <= 25 ? 0xFF9F0A : 0x34C759), 0);
+          int fw = std::isnan(fp) ? 0 : (int) (fp * 1.9f);
+          lv_obj_set_width(id(filter_bar), std::max(fw, 4));
+          lv_obj_set_style_bg_color(id(filter_bar), lv_color_hex(std::isnan(fp) ? 0x3A3A3A : fp <= 10 ? 0xFF453A : fp <= 25 ? 0xFF9F0A : 0x34C759), 0);
+          // alerts: red button on the home screen + message at the top of this page
+          std::string sf = id(safety_txt).state;
+          bool safety = !sf.empty() && sf != "OK" && sf != "unknown" && sf != "unavailable";
+          bool alert = safety || flow;
+          if (alert) TSTAT_CLR_FLAG(id(btn_alert), LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(id(btn_alert), LV_OBJ_FLAG_HIDDEN);
+          std::string msg = safety ? "Safety shutoff: " + sf + " - turn it back on when fixed"
+                          : flow ? std::string("Air filter is almost used up - time to replace it") : std::string("");
+          lv_label_set_text(id(lbl_safety), msg.c_str());
+
+  - id: send_pre_time
+    mode: restart
+    then:
+      - delay: 800ms
+      - homeassistant.action:
+          action: time.set_value
+          data:
+            entity_id: ${pre_time}
+          data_template:
+            time: "{{ t }}"
+          variables:
+            t: 'char b[12]; snprintf(b, sizeof(b), "%02d:%02d:00", id(st_pre_min) / 60, id(st_pre_min) % 60); return std::string(b);'
+
+  - id: send_pre_temp
+    mode: restart
+    then:
+      - delay: 800ms
+      - homeassistant.action:
+          action: number.set_value
+          data:
+            entity_id: ${pre_temp}
+          data_template:
+            value: "{{ v }}"
+          variables:
+            v: 'return id(st_pre_temp);'
+
+  - id: send_fan
+    mode: restart
+    then:
+      - delay: 800ms
+      - homeassistant.action:
+          action: number.set_value
+          data:
+            entity_id: ${fan_after}
+          data_template:
+            value: "{{ v }}"
+          variables:
+            v: 'return id(st_fan);'
+
+  - id: set_source
+    parameters:
+      opt: string
+    then:
+      - homeassistant.action:
+          action: select.select_option
+          data:
+            entity_id: ${t_source}
+          data_template:
+            option: "{{ o }}"
+          variables:
+            o: 'return opt;'
+
+  - id: set_preset
+    parameters:
+      pr: string
+    then:
+      - homeassistant.action:
+          action: climate.set_preset_mode
+          data:
+            entity_id: ${thermostat}
+          data_template:
+            preset_mode: "{{ p }}"
+          variables:
+            p: 'return pr;'
+
+  - id: update_now_cards
+    then:
+      - lambda: |-
+          char b[48];
+          float t = id(gov_t).state, h = id(gov_h).state;
+          if (std::isnan(t)) snprintf(b, sizeof(b), "--");
+          else snprintf(b, sizeof(b), "%.1f°  %.0f%%", t, std::isnan(h) ? 0.0f : h);
+          lv_label_set_text(id(gov_now), b);
+          float rt = id(cur_temp).state, rh = id(room_h).state;
+          if (std::isnan(rt)) snprintf(b, sizeof(b), "--");
+          else snprintf(b, sizeof(b), "%.1f°  %.0f%%", rt, std::isnan(rh) ? 0.0f : rh);
+          lv_label_set_text(id(room_now), b);
+          float hc = id(show_week) ? id(cost_w).state : id(cost_d).state;
+          float ac = id(show_week) ? id(cc_w).state : id(cc_d).state;
+          if (std::isnan(hc) && std::isnan(ac)) snprintf(b, sizeof(b), "--");
+          else snprintf(b, sizeof(b), "$%.2f", (std::isnan(hc) ? 0 : hc) + (std::isnan(ac) ? 0 : ac));
+          lv_label_set_text(id(cost_now), b);
+          lv_label_set_text(id(cost_lbl), id(show_week) ? "A/C cost - week" : "A/C cost - today");
+
+  - id: draw_charts             # moves existing dots/bars; never rebuilds the screen
+    then:
+      - lambda: |-
+          const int N = 48, X0 = 46, PW = 700, Y0 = 24, PH = 66;
+          bool wk = id(show_week);
+          auto &rt = wk ? id(w_rt) : id(d_rt);   auto &gt = wk ? id(w_gt) : id(d_gt);
+          auto &rh = wk ? id(w_rh) : id(d_rh);   auto &gh = wk ? id(w_gh) : id(d_gh);
+          auto &he = wk ? id(w_heat) : id(d_heat); auto &co = wk ? id(w_cool) : id(d_cool);
+          auto plot = [&](std::vector<float> &a, std::vector<float> &b,
+                          std::vector<lv_obj_t *> &da, std::vector<lv_obj_t *> &db,
+                          lv_obj_t *lmax, lv_obj_t *lmin, const char *fmt) {
+            if (da.size() < (size_t) N) return;
+            float mn = 1e9, mx = -1e9;
+            for (int i = 0; i < N; i++) {
+              if (!std::isnan(a[i])) { mn = std::min(mn, a[i]); mx = std::max(mx, a[i]); }
+              if (!std::isnan(b[i])) { mn = std::min(mn, b[i]); mx = std::max(mx, b[i]); }
+            }
+            bool empty = mn > mx;
+            if (!empty && mx - mn < 2) { float c = (mx + mn) / 2; mn = c - 1; mx = c + 1; }
+            for (int i = 0; i < N; i++) {
+              int x = X0 + i * PW / (N - 1) - 2;
+              for (int s = 0; s < 2; s++) {
+                float v = s == 0 ? a[i] : b[i]; lv_obj_t *o = s == 0 ? da[i] : db[i];
+                if (empty || std::isnan(v)) { lv_obj_set_style_bg_opa(o, LV_OPA_TRANSP, 0); continue; }
+                int y = Y0 + (int) ((mx - v) / (mx - mn) * PH) - 2;
+                lv_obj_set_pos(o, x, y);
+                lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+              }
+            }
+            char buf[16];
+            if (empty) { lv_label_set_text(lmax, "--"); lv_label_set_text(lmin, ""); return; }
+            snprintf(buf, sizeof(buf), fmt, mx); lv_label_set_text(lmax, buf);
+            snprintf(buf, sizeof(buf), fmt, mn); lv_label_set_text(lmin, buf);
+          };
+          plot(rt, gt, id(dots_rt), id(dots_gt), id(t_max), id(t_min), "%.0f°");
+          plot(rh, gh, id(dots_rh), id(dots_gh), id(h_max), id(h_min), "%.0f%%");
+          if (id(bars_heat).size() < (size_t) N) return;
+          for (int i = 0; i < N; i++) {
+            int x = X0 + i * PW / N;
+            int hh = (int) (std::min(he[i], 1.0f) * PH), ch = (int) (std::min(co[i], 1.0f) * PH);
+            lv_obj_set_size(id(bars_heat)[i], 11, hh);
+            lv_obj_set_pos(id(bars_heat)[i], x, Y0 + PH - hh);
+            lv_obj_set_style_bg_opa(id(bars_heat)[i], hh > 0 ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+            lv_obj_set_size(id(bars_cool)[i], 11, ch);
+            lv_obj_set_pos(id(bars_cool)[i], x, Y0 + PH - hh - ch);
+            lv_obj_set_style_bg_opa(id(bars_cool)[i], ch > 0 ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+          }
+
+  - id: set_range
+    then:
+      - lambda: |-
+          lv_obj_set_style_bg_color(id(btn_24h), lv_color_hex(id(show_week) ? 0x1A1A1A : 0x3A3A3A), 0);
+          lv_obj_set_style_bg_color(id(btn_7d),  lv_color_hex(id(show_week) ? 0x3A3A3A : 0x1A1A1A), 0);
+      - script.execute: draw_charts
+      - script.execute: update_now_cards
+
+# history sampling: once a minute
+interval:
+  - interval: 3s
+    then:
+      - lambda: |-
+          bool w = wifi::global_wifi_component->is_connected();
+          bool a = api::global_api_server != nullptr && api::global_api_server->is_connected();
+          const char *g = "\U000F05AA"; uint32_t col = 0xFF453A;      // red = no WiFi
+          if (w) {
+            float r = id(wifi_rssi).state;
+            g = (std::isnan(r) || r > -55) ? "\U000F0928" : r > -67 ? "\U000F0925" : r > -78 ? "\U000F0922" : "\U000F091F";
+            col = a ? 0xCFCFCF : 0xFF9F0A;                              // orange = WiFi but no Home Assistant
+          }
+          lv_label_set_text(id(wifi_icon), g);
+          lv_obj_set_style_text_color(id(wifi_icon), lv_color_hex(col), 0);
+          static int last = -1; int now = (w ? 1 : 0) + (a ? 2 : 0);
+          if (now != last) { last = now; id(update_status).execute(); }
+          id(refresh_net).execute();
+          // thunderstorm: random lightning flash behind the standby text
+          if (id(wx_now) == 2 && random_uint32() % 3 == 0) {
+            lv_anim_t a;
+            lv_anim_init(&a);
+            lv_anim_set_var(&a, id(wx_flash));
+            lv_anim_set_exec_cb(&a, [](void *o, int32_t v) { lv_obj_set_style_bg_opa((lv_obj_t *) o, (lv_opa_t) v, 0); });
+            lv_anim_set_values(&a, 170, 0);
+          #if LVGL_VERSION_MAJOR >= 9
+            lv_anim_set_duration(&a, 600);
+          #else
+            lv_anim_set_time(&a, 600);
+          #endif
+            lv_anim_start(&a);
+          }
+
+  - interval: 60s
+    then:
+      - lambda: |-
+          float v[4] = { id(cur_temp).state, id(gov_t).state, id(room_h).state, id(gov_h).state };
+          bool h = id(hvac_action).state == "heating", c = id(hvac_action).state == "cooling";
+          auto add = [&](std::vector<float> &acc) {
+            for (int k = 0; k < 4; k++) if (!std::isnan(v[k])) { acc[k * 2] += v[k]; acc[k * 2 + 1] += 1; }
+            if (h) acc[8] += 1;
+            if (c) acc[9] += 1;
+            acc[10] += 1;
+          };
+          add(id(acc_d)); add(id(acc_w));
+          auto push = [](std::vector<float> &s, float x) { s.erase(s.begin()); s.push_back(x); };
+          bool changed = false;
+          {
+            auto &a = id(acc_d);
+            if (a[10] >= 30) {
+              auto avg = [&](int k) { return a[k * 2 + 1] > 0 ? a[k * 2] / a[k * 2 + 1] : NAN; };
+              push(id(d_rt), avg(0)); push(id(d_gt), avg(1)); push(id(d_rh), avg(2)); push(id(d_gh), avg(3));
+              push(id(d_heat), a[8] / a[10]); push(id(d_cool), a[9] / a[10]);
+              std::fill(a.begin(), a.end(), 0.0f); changed = true;
+            }
+          }
+          {
+            auto &a = id(acc_w);
+            if (a[10] >= 210) {
+              auto avg = [&](int k) { return a[k * 2 + 1] > 0 ? a[k * 2] / a[k * 2 + 1] : NAN; };
+              push(id(w_rt), avg(0)); push(id(w_gt), avg(1)); push(id(w_rh), avg(2)); push(id(w_gh), avg(3));
+              push(id(w_heat), a[8] / a[10]); push(id(w_cool), a[9] / a[10]);
+              std::fill(a.begin(), a.end(), 0.0f); changed = true;
+            }
+          }
+          if (changed) id(draw_charts).execute();
+
+# ---------------- Screens ----------------
+lvgl:
+  displays: main_display
+  touchscreens: my_touch
+  buffer_size: 12%
+  default_font: montserrat_20
+  on_idle:
+    - timeout: 60s
+      then:
+        - lvgl.page.show:
+            id: clock_page
+            animation: NONE
+  pages:
+    # ======================= HOME =======================
+    - id: home_page
+      bg_color: 0x000000
+      widgets:
+        # history button (top-left)
+        - button:
+            x: 16
+            y: 12
+            width: 64
+            height: 52
+            radius: 14
+            bg_color: 0x111111
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x2A2A2A
+            widgets:
+              - label: { align: CENTER, text: "\U000F012A", text_font: icon_s, text_color: 0xCFCFCF }
+            on_click:
+              - lvgl.page.show: { id: history_page, animation: NONE }
+              - script.execute: update_now_cards
+              - script.execute: draw_charts
+
+        # settings (gear) + safety alert (red, only when the thermostat shut itself off)
+        - button:
+            x: 92
+            y: 12
+            width: 64
+            height: 52
+            radius: 14
+            bg_color: 0x111111
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x2A2A2A
+            widgets:
+              - label: { align: CENTER, text: "\U000F0493", text_font: icon_s, text_color: 0xCFCFCF }
+            on_click:
+              - lvgl.page.show: { id: settings_page, animation: NONE }
+              - script.execute: refresh_settings
+        - button:
+            id: btn_alert
+            x: 168
+            y: 12
+            width: 64
+            height: 52
+            radius: 14
+            bg_color: 0x3A0D0D
+            border_width: 2
+            border_color: 0xFF453A
+            shadow_width: 0
+            hidden: true
+            pressed:
+              bg_color: 0x5A1515
+            widgets:
+              - label: { align: CENTER, text: "\U000F0026", text_font: icon_s, text_color: 0xFF453A }
+            on_click:
+              - lvgl.page.show: { id: settings_page, animation: NONE }
+              - script.execute: refresh_settings
+
+        # wifi / Home Assistant connection
+        - button:
+            x: 584
+            y: 12
+            width: 56
+            height: 52
+            radius: 14
+            bg_opa: TRANSP
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x2A2A2A
+              bg_opa: COVER
+            widgets:
+              - label: { id: wifi_icon, align: CENTER, text: "\U000F05AA", text_font: icon_s, text_color: 0xFF453A }
+            on_click:
+              - lvgl.page.show: { id: network_page, animation: NONE }
+              - script.execute: refresh_net
+
+        # weather (top-right)
+        - label: { id: w_icon_s, x: 650, y: 20, text: "\U000F0590", text_font: icon_s, text_color: 0xCFCFCF }
+        - obj:
+            id: w_temp_s
+            x: 694
+            y: 24
+            width: 70
+            height: 40
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            clickable: false
+            widgets:
+            - roller:
+                id: r_ws1
+                x: 0
+                y: 0
+                width: 19
+                options: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                selected_index: 6
+                visible_row_count: 1
+                mode: NORMAL
+                clickable: false
+                text_font: montserrat_28
+                text_color: 0xCFCFCF
+                bg_opa: TRANSP
+                border_width: 0
+                pad_all: 0
+                selected: { bg_opa: TRANSP, text_color: 0xCFCFCF, text_font: montserrat_28 }
+            - roller:
+                id: r_ws0
+                x: 19
+                y: 0
+                width: 19
+                options: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                selected_index: 0
+                visible_row_count: 1
+                mode: NORMAL
+                clickable: false
+                text_font: montserrat_28
+                text_color: 0xCFCFCF
+                bg_opa: TRANSP
+                border_width: 0
+                pad_all: 0
+                selected: { bg_opa: TRANSP, text_color: 0xCFCFCF, text_font: montserrat_28 }
+            - label: { x: 38, y: 0, text: "°", text_font: montserrat_28, text_color: 0xCFCFCF }
+
+        # tap the weather -> 7-day forecast
+        - button:
+            x: 640
+            y: 8
+            width: 150
+            height: 60
+            radius: 14
+            bg_opa: TRANSP
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x2A2A2A
+              bg_opa: 60%
+            on_click:
+              - lvgl.page.show: { id: forecast_page, animation: NONE }
+              - script.execute: refresh_fc
+        # comfort (from humidity)
+        - label: { id: comfort_lbl, x: 344, y: 102, width: 112, text: "", text_font: montserrat_14, text_color: 0x5A5A5A, text_align: CENTER }
+
+        # humidity
+        - obj:
+            id: hum_box
+            x: 344
+            y: 60
+            width: 112
+            height: 44
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            clickable: false
+            widgets:
+            - label: { x: 0, y: 0, text: "\U000F058E", text_font: icon_s, text_color: 0x8A8F98 }
+            - roller:
+                id: r_hu1
+                x: 42
+                y: 4
+                width: 19
+                options: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                selected_index: 5
+                visible_row_count: 1
+                mode: NORMAL
+                clickable: false
+                text_font: montserrat_28
+                text_color: 0xCFCFCF
+                bg_opa: TRANSP
+                border_width: 0
+                pad_all: 0
+                selected: { bg_opa: TRANSP, text_color: 0xCFCFCF, text_font: montserrat_28 }
+            - roller:
+                id: r_hu0
+                x: 61
+                y: 4
+                width: 19
+                options: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                selected_index: 0
+                visible_row_count: 1
+                mode: NORMAL
+                clickable: false
+                text_font: montserrat_28
+                text_color: 0xCFCFCF
+                bg_opa: TRANSP
+                border_width: 0
+                pad_all: 0
+                selected: { bg_opa: TRANSP, text_color: 0xCFCFCF, text_font: montserrat_28 }
+            - label: { x: 81, y: 4, text: "%", text_font: montserrat_28, text_color: 0xCFCFCF }
+
+        # big current temperature (odometer rollers)
+        - roller:
+            id: r_t1
+            x: 292
+            y: 92
+            width: 106
+            options: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+            selected_index: 7
+            visible_row_count: 1
+            mode: NORMAL
+            clickable: false
+            text_font: font_temp
+            text_color: 0xFFFFFF
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            selected:
+              bg_opa: TRANSP
+              text_color: 0xFFFFFF
+              text_font: font_temp
+        - roller:
+            id: r_t0
+            x: 398
+            y: 92
+            width: 106
+            options: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+            selected_index: 0
+            visible_row_count: 1
+            mode: NORMAL
+            clickable: false
+            text_font: font_temp
+            text_color: 0xFFFFFF
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            selected:
+              bg_opa: TRANSP
+              text_color: 0xFFFFFF
+              text_font: font_temp
+        - label: { x: 508, y: 118, text: "°F", text_font: montserrat_36, text_color: 0xFFFFFF }
+        - label: { id: act_icon, x: 506, y: 200, text: "\U000F0238", text_font: icon_m, text_color: 0xFF7A1A, opa: TRANSP }
+
+        # mode (left) - tap to cycle Off > Heat > Cool > Auto
+        - button:
+            x: 28
+            y: 140
+            width: 140
+            height: 160
+            radius: 24
+            bg_color: 0x111111
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x2A2A2A
+            widgets:
+              - label: { id: mode_icon, align: CENTER, y: -18, text: "\U000F0425", text_font: icon_m, text_color: 0x8A8F98 }
+              - label: { id: mode_txt, align: CENTER, y: 44, text: "Off", text_font: montserrat_20, text_color: 0xFFFFFF }
+            on_click:
+              - lvgl.widget.show: mode_menu
+
+        # fan (right) - tap to toggle Auto / On
+        - button:
+            x: 632
+            y: 140
+            width: 140
+            height: 160
+            radius: 24
+            bg_color: 0x111111
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x2A2A2A
+            widgets:
+              - label: { id: fan_icon, align: CENTER, y: -18, text: "\U000F0210", text_font: icon_m, text_color: 0x8A8F98 }
+              - label: { id: fan_txt, align: CENTER, y: 44, text: "Auto", text_font: montserrat_20, text_color: 0xFFFFFF }
+            on_click:
+              - script.execute: toggle_fan
+
+        # minus
+        - button:
+            x: 176
+            y: 318
+            width: 88
+            height: 88
+            radius: 44
+            bg_color: 0x000000
+            border_width: 2
+            border_color: 0x5A5A5A
+            shadow_width: 0
+            pressed:
+              bg_color: 0x2A2A2A
+              border_color: 0xFFFFFF
+            widgets:
+              - label: { align: CENTER, text: "-", text_font: montserrat_48, text_color: 0xFFFFFF }
+            on_click:
+              - script.execute: { id: nudge, d: -1 }
+            on_long_press_repeat:
+              - script.execute: { id: nudge, d: -1 }
+
+        # heat setpoint (tap to select)
+        - obj:
+            id: heat_box
+            x: 280
+            y: 312
+            width: 120
+            height: 100
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            on_click:
+              - lambda: 'id(sel) = 0;'
+              - script.execute: move_sel
+            widgets:
+              - roller:
+                  id: r_l1
+                  x: 6
+                  y: 0
+                  width: 54
+                  options: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                  selected_index: 6
+                  visible_row_count: 1
+                  mode: NORMAL
+                  clickable: false
+                  text_font: font_set
+                  text_color: 0xFF7A1A
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  selected: { bg_opa: TRANSP, text_color: 0xFF7A1A, text_font: font_set }
+              - roller:
+                  id: r_l0
+                  x: 60
+                  y: 0
+                  width: 54
+                  options: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                  selected_index: 8
+                  visible_row_count: 1
+                  mode: NORMAL
+                  clickable: false
+                  text_font: font_set
+                  text_color: 0xFF7A1A
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  selected: { bg_opa: TRANSP, text_color: 0xFF7A1A, text_font: font_set }
+
+        # cool setpoint (tap to select)
+        - obj:
+            id: cool_box
+            x: 410
+            y: 312
+            width: 120
+            height: 100
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            on_click:
+              - lambda: 'id(sel) = 1;'
+              - script.execute: move_sel
+            widgets:
+              - roller:
+                  id: r_h1
+                  x: 6
+                  y: 0
+                  width: 54
+                  options: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                  selected_index: 7
+                  visible_row_count: 1
+                  mode: NORMAL
+                  clickable: false
+                  text_font: font_set
+                  text_color: 0x4DA3FF
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  selected: { bg_opa: TRANSP, text_color: 0x4DA3FF, text_font: font_set }
+              - roller:
+                  id: r_h0
+                  x: 60
+                  y: 0
+                  width: 54
+                  options: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                  selected_index: 6
+                  visible_row_count: 1
+                  mode: NORMAL
+                  clickable: false
+                  text_font: font_set
+                  text_color: 0x4DA3FF
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  selected: { bg_opa: TRANSP, text_color: 0x4DA3FF, text_font: font_set }
+
+        # plus
+        - button:
+            x: 536
+            y: 318
+            width: 88
+            height: 88
+            radius: 44
+            bg_color: 0x000000
+            border_width: 2
+            border_color: 0x5A5A5A
+            shadow_width: 0
+            pressed:
+              bg_color: 0x2A2A2A
+              border_color: 0xFFFFFF
+            widgets:
+              - label: { align: CENTER, text: "+", text_font: montserrat_48, text_color: 0xFFFFFF }
+            on_click:
+              - script.execute: { id: nudge, d: 1 }
+            on_long_press_repeat:
+              - script.execute: { id: nudge, d: 1 }
+
+        # which setpoint +/- changes
+        - obj:
+            id: sel_bar
+            x: 290
+            y: 414
+            width: 100
+            height: 4
+            radius: 2
+            bg_color: 0xFF7A1A
+            border_width: 0
+            scrollable: false
+            clickable: false
+
+        - label: { id: lbl_status, align: BOTTOM_MID, y: -18, text: "", text_font: montserrat_20, text_color: 0x8A8F98 }
+
+        # mode picker (opens from the Mode button)
+        - obj:
+            id: mode_menu
+            x: 0
+            y: 0
+            width: 800
+            height: 480
+            hidden: true
+            bg_color: 0x000000
+            bg_opa: 70%
+            border_width: 0
+            radius: 0
+            scrollable: false
+            on_click:
+              - lvgl.widget.hide: mode_menu
+            widgets:
+              - obj:
+                  align: CENTER
+                  width: 580
+                  height: 230
+                  radius: 24
+                  bg_color: 0x111111
+                  border_width: 0
+                  scrollable: false
+                  widgets:
+                    - label: { x: 6, y: 4, text: "Mode", text_font: montserrat_20, text_color: 0x8A8F98 }
+                    - button:
+                        x: 0
+                        y: 70
+                        width: 120
+                        height: 120
+                        radius: 22
+                        bg_color: 0x1A1A1A
+                        border_width: 0
+                        shadow_width: 0
+                        pressed:
+                          bg_color: 0x333333
+                        widgets:
+                          - label: { align: CENTER, y: -16, text: "\U000F0425", text_font: icon_m, text_color: 0x8A8F98 }
+                          - label: { align: CENTER, y: 40, text: "Off", text_font: montserrat_20, text_color: 0xFFFFFF }
+                        on_click:
+                          - script.execute: { id: set_mode, mode: "off" }
+                          - lvgl.widget.hide: mode_menu
+                    - button:
+                        x: 134
+                        y: 70
+                        width: 120
+                        height: 120
+                        radius: 22
+                        bg_color: 0x1A1A1A
+                        border_width: 0
+                        shadow_width: 0
+                        pressed:
+                          bg_color: 0x333333
+                        widgets:
+                          - label: { align: CENTER, y: -16, text: "\U000F0238", text_font: icon_m, text_color: 0xFF7A1A }
+                          - label: { align: CENTER, y: 40, text: "Heat", text_font: montserrat_20, text_color: 0xFFFFFF }
+                        on_click:
+                          - script.execute: { id: set_mode, mode: "heat" }
+                          - lvgl.widget.hide: mode_menu
+                    - button:
+                        x: 268
+                        y: 70
+                        width: 120
+                        height: 120
+                        radius: 22
+                        bg_color: 0x1A1A1A
+                        border_width: 0
+                        shadow_width: 0
+                        pressed:
+                          bg_color: 0x333333
+                        widgets:
+                          - label: { align: CENTER, y: -16, text: "\U000F0717", text_font: icon_m, text_color: 0x4DA3FF }
+                          - label: { align: CENTER, y: 40, text: "Cool", text_font: montserrat_20, text_color: 0xFFFFFF }
+                        on_click:
+                          - script.execute: { id: set_mode, mode: "cool" }
+                          - lvgl.widget.hide: mode_menu
+                    - button:
+                        x: 402
+                        y: 70
+                        width: 120
+                        height: 120
+                        radius: 22
+                        bg_color: 0x1A1A1A
+                        border_width: 0
+                        shadow_width: 0
+                        pressed:
+                          bg_color: 0x333333
+                        widgets:
+                          - label: { align: CENTER, y: -16, text: "\U000F0210", text_font: icon_m, text_color: 0x34C759 }
+                          - label: { align: CENTER, y: 40, text: "Fan", text_font: montserrat_20, text_color: 0xFFFFFF }
+                        on_click:
+                          - script.execute: { id: set_mode, mode: "fan_only" }
+                          - lvgl.widget.hide: mode_menu
+
+    # ======================= STANDBY (clock) =======================
+    - id: clock_page
+      bg_color: 0x000000
+      scrollable: false          # particles slide in from off-screen - don't let the page scroll
+      scrollbar_mode: "OFF"
+      widgets:
+        # heat / cool effect (embers or cool air streaks while the furnace / AC runs)
+        - obj: { id: hv0, x: 0, y: 500, width: 6, height: 6, radius: 3, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: hv1, x: 0, y: 500, width: 6, height: 6, radius: 3, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: hv2, x: 0, y: 500, width: 6, height: 6, radius: 3, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: hv3, x: 0, y: 500, width: 6, height: 6, radius: 3, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: hv4, x: 0, y: 500, width: 6, height: 6, radius: 3, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: hv5, x: 0, y: 500, width: 6, height: 6, radius: 3, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: hv6, x: 0, y: 500, width: 6, height: 6, radius: 3, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: hv7, x: 0, y: 500, width: 6, height: 6, radius: 3, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: hv8, x: 0, y: 500, width: 6, height: 6, radius: 3, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: hv9, x: 0, y: 500, width: 6, height: 6, radius: 3, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: hv10, x: 0, y: 500, width: 6, height: 6, radius: 3, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: hv11, x: 0, y: 500, width: 6, height: 6, radius: 3, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        # weather effects (rain / snow / hail / sun motes) + lightning flash layer
+        - obj: { id: pr0, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr1, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr2, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr3, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr4, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr5, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr6, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr7, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr8, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr9, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr10, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr11, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr12, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr13, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr14, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr15, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr16, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr17, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr18, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pr19, x: 0, y: -40, width: 2, height: 20, radius: 1, bg_color: 0x7FB8FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: wx_flash, x: 0, y: 0, width: 800, height: 480, radius: 0, bg_color: 0xDDE8FF, bg_opa: TRANSP, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        # holiday particles (drawn first = behind the text; only shown during a holiday theme)
+        - label: { id: pg0, x: 0, y: -40, text: "", text_font: icon_xs, text_color: 0xFFFFFF, hidden: true, clickable: false }
+        - label: { id: pg1, x: 0, y: -40, text: "", text_font: icon_xs, text_color: 0xFFFFFF, hidden: true, clickable: false }
+        - label: { id: pg2, x: 0, y: -40, text: "", text_font: icon_xs, text_color: 0xFFFFFF, hidden: true, clickable: false }
+        - label: { id: pg3, x: 0, y: -40, text: "", text_font: icon_xs, text_color: 0xFFFFFF, hidden: true, clickable: false }
+        - label: { id: pg4, x: 0, y: -40, text: "", text_font: icon_xs, text_color: 0xFFFFFF, hidden: true, clickable: false }
+        - label: { id: pg5, x: 0, y: -40, text: "", text_font: icon_xs, text_color: 0xFFFFFF, hidden: true, clickable: false }
+        - label: { id: pg6, x: 0, y: -40, text: "", text_font: icon_xs, text_color: 0xFFFFFF, hidden: true, clickable: false }
+        - label: { id: pg7, x: 0, y: -40, text: "", text_font: icon_xs, text_color: 0xFFFFFF, hidden: true, clickable: false }
+        - label: { id: pg8, x: 0, y: -40, text: "", text_font: icon_xs, text_color: 0xFFFFFF, hidden: true, clickable: false }
+        - label: { id: pg9, x: 0, y: -40, text: "", text_font: icon_xs, text_color: 0xFFFFFF, hidden: true, clickable: false }
+        - label: { id: pg10, x: 0, y: -40, text: "", text_font: icon_xs, text_color: 0xFFFFFF, hidden: true, clickable: false }
+        - label: { id: pg11, x: 0, y: -40, text: "", text_font: icon_xs, text_color: 0xFFFFFF, hidden: true, clickable: false }
+        - obj: { id: pd0, x: 0, y: -40, width: 7, height: 7, radius: 4, bg_color: 0xFFD60A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pd1, x: 0, y: -40, width: 7, height: 7, radius: 4, bg_color: 0xFFD60A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pd2, x: 0, y: -40, width: 7, height: 7, radius: 4, bg_color: 0xFFD60A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pd3, x: 0, y: -40, width: 7, height: 7, radius: 4, bg_color: 0xFFD60A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pd4, x: 0, y: -40, width: 7, height: 7, radius: 4, bg_color: 0xFFD60A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pd5, x: 0, y: -40, width: 7, height: 7, radius: 4, bg_color: 0xFFD60A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pd6, x: 0, y: -40, width: 7, height: 7, radius: 4, bg_color: 0xFFD60A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pd7, x: 0, y: -40, width: 7, height: 7, radius: 4, bg_color: 0xFFD60A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pd8, x: 0, y: -40, width: 7, height: 7, radius: 4, bg_color: 0xFFD60A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pd9, x: 0, y: -40, width: 7, height: 7, radius: 4, bg_color: 0xFFD60A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pd10, x: 0, y: -40, width: 7, height: 7, radius: 4, bg_color: 0xFFD60A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: pd11, x: 0, y: -40, width: 7, height: 7, radius: 4, bg_color: 0xFFD60A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj:
+            x: 0
+            y: 0
+            width: 800
+            height: 480
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            clickable: false
+            layout: { type: flex, flex_flow: column, flex_align_main: center, flex_align_cross: center, flex_align_track: center , pad_row: 6}
+            widgets:
+            # --- time (odometer digits, auto-centered) ---
+            - obj:
+                id: clock_box
+                width: size_content
+                height: size_content
+                bg_opa: TRANSP
+                border_width: 0
+                pad_all: 0
+                scrollable: false
+                clickable: false
+                layout: { type: flex, flex_flow: row, flex_align_main: center, flex_align_cross: end, flex_align_track: end , pad_column: 2}
+                widgets:
+                - roller:
+                    id: c_h1
+                    options: [" ", "1"]
+                    selected_index: 0
+                    visible_row_count: 1
+                    mode: NORMAL
+                    clickable: false
+                    text_font: font_clock
+                    text_color: 0xFFFFFF
+                    bg_opa: TRANSP
+                    border_width: 0
+                    pad_all: 0
+                    selected: { bg_opa: TRANSP, text_color: 0xFFFFFF, text_font: font_clock }
+                - roller:
+                    id: c_h0
+                    options: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                    selected_index: 2
+                    visible_row_count: 1
+                    mode: NORMAL
+                    clickable: false
+                    text_font: font_clock
+                    text_color: 0xFFFFFF
+                    bg_opa: TRANSP
+                    border_width: 0
+                    pad_all: 0
+                    selected: { bg_opa: TRANSP, text_color: 0xFFFFFF, text_font: font_clock }
+                - label: { id: clock_colon, text: ":", text_font: font_clock, text_color: 0xFFFFFF, pad_left: 4, pad_right: 4, pad_bottom: 14 }
+                - roller:
+                    id: c_m1
+                    options: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                    selected_index: 0
+                    visible_row_count: 1
+                    mode: NORMAL
+                    clickable: false
+                    text_font: font_clock
+                    text_color: 0xFFFFFF
+                    bg_opa: TRANSP
+                    border_width: 0
+                    pad_all: 0
+                    selected: { bg_opa: TRANSP, text_color: 0xFFFFFF, text_font: font_clock }
+                - roller:
+                    id: c_m0
+                    options: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                    selected_index: 0
+                    visible_row_count: 1
+                    mode: NORMAL
+                    clickable: false
+                    text_font: font_clock
+                    text_color: 0xFFFFFF
+                    bg_opa: TRANSP
+                    border_width: 0
+                    pad_all: 0
+                    selected: { bg_opa: TRANSP, text_color: 0xFFFFFF, text_font: font_clock }
+            - label: { id: clock_date, text: "", text_font: montserrat_28, text_color: 0x8A8F98 }
+
+            # --- holiday greeting (hidden unless a theme is on) ---
+            - obj:
+                id: hol_row
+                hidden: true
+                width: size_content
+                height: size_content
+                bg_opa: TRANSP
+                border_width: 0
+                pad_all: 0
+                pad_top: 4
+                scrollable: false
+                clickable: false
+                layout: { type: flex, flex_flow: row, flex_align_main: center, flex_align_cross: center, flex_align_track: center, pad_column: 10 }
+                widgets:
+                - label: { id: hol_icon, text: "", text_font: icon_s, text_color: 0xFFFFFF }
+                - label: { id: hol_lbl, text: "", text_font: montserrat_28, text_color: 0xFFFFFF }
+
+            # --- weather now + next 3 days ---
+            - obj:
+                width: size_content
+                height: size_content
+                bg_opa: TRANSP
+                border_width: 0
+                pad_all: 0
+                scrollable: false
+                clickable: false
+                pad_top: 10
+                pad_bottom: 8
+                layout: { type: flex, flex_flow: row, flex_align_main: center, flex_align_cross: center, flex_align_track: center , pad_column: 18}
+                widgets:
+                - label: { id: w_icon_l, text: "\U000F0590", text_font: icon_l, text_color: 0xCFCFCF }
+                - obj:
+                    width: size_content
+                    height: size_content
+                    bg_opa: TRANSP
+                    border_width: 0
+                    pad_all: 0
+                    scrollable: false
+                    clickable: false
+                    layout: { type: flex, flex_flow: column, flex_align_main: center, flex_align_cross: start, flex_align_track: start , pad_row: 0}
+                    widgets:
+                    - obj:
+                        id: w_temp_l
+                        width: size_content
+                        height: size_content
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        scrollable: false
+                        clickable: false
+                        layout: { type: flex, flex_flow: row, flex_align_main: start, flex_align_cross: start, flex_align_track: start }
+                        widgets:
+                        - roller:
+                            id: r_wl1
+                            width: 30
+                            options: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                            selected_index: 6
+                            visible_row_count: 1
+                            mode: NORMAL
+                            clickable: false
+                            text_font: montserrat_48
+                            text_color: 0xFFFFFF
+                            bg_opa: TRANSP
+                            border_width: 0
+                            pad_all: 0
+                            selected: { bg_opa: TRANSP, text_color: 0xFFFFFF, text_font: montserrat_48 }
+                        - roller:
+                            id: r_wl0
+                            width: 30
+                            options: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                            selected_index: 0
+                            visible_row_count: 1
+                            mode: NORMAL
+                            clickable: false
+                            text_font: montserrat_48
+                            text_color: 0xFFFFFF
+                            bg_opa: TRANSP
+                            border_width: 0
+                            pad_all: 0
+                            selected: { bg_opa: TRANSP, text_color: 0xFFFFFF, text_font: montserrat_48 }
+                        - label: { text: "°", text_font: montserrat_48, text_color: 0xFFFFFF }
+                    - label: { id: w_cond_l, text: "", text_font: montserrat_20, text_color: 0x8A8F98 }
+                - obj:
+                    width: 2
+                    height: 96
+                    radius: 1
+                    bg_color: 0x2A2A2A
+                    bg_opa: COVER
+                    border_width: 0
+                    scrollable: false
+                    clickable: false
+                - obj:
+                    width: 92
+                    height: size_content
+                    bg_opa: TRANSP
+                    border_width: 0
+                    pad_all: 0
+                    scrollable: false
+                    clickable: false
+                    layout: { type: flex, flex_flow: column, flex_align_main: center, flex_align_cross: center, flex_align_track: center , pad_row: 4}
+                    widgets:
+                      - label: { id: fc_d0, text: "", text_font: montserrat_20, text_color: 0x8A8F98 }
+                      - label: { id: fc_i0, text: "", text_font: icon_s, text_color: 0xCFCFCF }
+                      - obj:
+                          width: size_content
+                          height: size_content
+                          bg_opa: TRANSP
+                          border_width: 0
+                          pad_all: 0
+                          scrollable: false
+                          clickable: false
+                          layout: { type: flex, flex_flow: row, flex_align_main: center, flex_align_cross: center, flex_align_track: center , pad_column: 8}
+                          widgets:
+                            - label: { id: fc_h0, text: "", text_font: montserrat_20, text_color: 0xFFFFFF }
+                            - label: { id: fc_l0, text: "", text_font: montserrat_20, text_color: 0x5A5A5A }
+                - obj:
+                    width: 92
+                    height: size_content
+                    bg_opa: TRANSP
+                    border_width: 0
+                    pad_all: 0
+                    scrollable: false
+                    clickable: false
+                    layout: { type: flex, flex_flow: column, flex_align_main: center, flex_align_cross: center, flex_align_track: center , pad_row: 4}
+                    widgets:
+                      - label: { id: fc_d1, text: "", text_font: montserrat_20, text_color: 0x8A8F98 }
+                      - label: { id: fc_i1, text: "", text_font: icon_s, text_color: 0xCFCFCF }
+                      - obj:
+                          width: size_content
+                          height: size_content
+                          bg_opa: TRANSP
+                          border_width: 0
+                          pad_all: 0
+                          scrollable: false
+                          clickable: false
+                          layout: { type: flex, flex_flow: row, flex_align_main: center, flex_align_cross: center, flex_align_track: center , pad_column: 8}
+                          widgets:
+                            - label: { id: fc_h1, text: "", text_font: montserrat_20, text_color: 0xFFFFFF }
+                            - label: { id: fc_l1, text: "", text_font: montserrat_20, text_color: 0x5A5A5A }
+                - obj:
+                    width: 92
+                    height: size_content
+                    bg_opa: TRANSP
+                    border_width: 0
+                    pad_all: 0
+                    scrollable: false
+                    clickable: false
+                    layout: { type: flex, flex_flow: column, flex_align_main: center, flex_align_cross: center, flex_align_track: center , pad_row: 4}
+                    widgets:
+                      - label: { id: fc_d2, text: "", text_font: montserrat_20, text_color: 0x8A8F98 }
+                      - label: { id: fc_i2, text: "", text_font: icon_s, text_color: 0xCFCFCF }
+                      - obj:
+                          width: size_content
+                          height: size_content
+                          bg_opa: TRANSP
+                          border_width: 0
+                          pad_all: 0
+                          scrollable: false
+                          clickable: false
+                          layout: { type: flex, flex_flow: row, flex_align_main: center, flex_align_cross: center, flex_align_track: center , pad_column: 8}
+                          widgets:
+                            - label: { id: fc_h2, text: "", text_font: montserrat_20, text_color: 0xFFFFFF }
+                            - label: { id: fc_l2, text: "", text_font: montserrat_20, text_color: 0x5A5A5A }
+
+            # --- set temperature (orange = heat, blue = cool) + inside temp ---
+            - obj:
+                width: size_content
+                height: size_content
+                bg_opa: TRANSP
+                border_width: 0
+                pad_all: 0
+                scrollable: false
+                clickable: false
+                layout: { type: flex, flex_flow: row, flex_align_main: center, flex_align_cross: center, flex_align_track: center , pad_column: 10}
+                widgets:
+                - label: { id: st_icon, text: "\U000F0425", text_font: icon_s, text_color: 0x8A8F98 }
+                - obj:
+                    id: st_box
+                    width: size_content
+                    height: size_content
+                    bg_opa: TRANSP
+                    border_width: 0
+                    pad_all: 0
+                    scrollable: false
+                    clickable: false
+                    layout: { type: flex, flex_flow: row, flex_align_main: start, flex_align_cross: start, flex_align_track: start }
+                    widgets:
+                    - roller:
+                        id: r_st1
+                        width: 30
+                        options: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                        selected_index: 6
+                        visible_row_count: 1
+                        mode: NORMAL
+                        clickable: false
+                        text_font: montserrat_48
+                        text_color: 0x8A8F98
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        selected: { bg_opa: TRANSP, text_color: 0x8A8F98, text_font: montserrat_48 }
+                    - roller:
+                        id: r_st0
+                        width: 30
+                        options: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                        selected_index: 8
+                        visible_row_count: 1
+                        mode: NORMAL
+                        clickable: false
+                        text_font: montserrat_48
+                        text_color: 0x8A8F98
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        selected: { bg_opa: TRANSP, text_color: 0x8A8F98, text_font: montserrat_48 }
+                    - label: { id: st_deg, text: "°", text_font: montserrat_48, text_color: 0x8A8F98 }
+                - label: { id: st_off, text: "Off", text_font: montserrat_28, text_color: 0x8A8F98 }
+                - label: { id: clock_inside, text: "Inside --°", text_font: montserrat_20, text_color: 0x5A5A5A, pad_left: 22 }
+
+        # tap anywhere to go back
+        - obj:
+            x: 0
+            y: 0
+            width: 800
+            height: 480
+            bg_opa: TRANSP
+            border_width: 0
+            scrollable: false
+            on_click:
+              - lvgl.page.show: { id: home_page, animation: NONE }
+
+    # ======================= 7-DAY FORECAST =======================
+    - id: forecast_page
+      bg_color: 0x000000
+      scrollable: false
+      widgets:
+        - button:
+            x: 16
+            y: 10
+            width: 56
+            height: 46
+            radius: 12
+            bg_color: 0x111111
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x2A2A2A
+            widgets:
+              - label: { align: CENTER, text: "\U000F004D", text_font: icon_s, text_color: 0xFFFFFF }
+            on_click:
+              - lvgl.page.show: { id: home_page, animation: NONE }
+        - label: { x: 88, y: 18, text: "7-day forecast", text_font: montserrat_28, text_color: 0xFFFFFF }
+        - button:
+            id: fct0
+            x: 20
+            y: 66
+            width: 102
+            height: 150
+            radius: 16
+            bg_color: 0x111111
+            border_width: 0
+            border_color: 0x4DA3FF
+            shadow_width: 0
+            pad_all: 0
+            pressed:
+              bg_color: 0x2A2A2A
+            widgets:
+              - label: { id: fcd_0, align: TOP_MID, y: 8, text: "", text_font: montserrat_16, text_color: 0x8A8F98 }
+              - label: { id: fci_0, align: TOP_MID, y: 32, text: "", text_font: icon_s, text_color: 0xCFCFCF }
+              - label: { id: fch_0, align: TOP_MID, y: 76, text: "", text_font: montserrat_20, text_color: 0xFFFFFF }
+              - label: { id: fcl_0, align: TOP_MID, y: 100, text: "", text_font: montserrat_16, text_color: 0x5A5A5A }
+              - label: { id: fcr_0, align: TOP_MID, y: 124, text: "", text_font: montserrat_14, text_color: 0x4DA3FF }
+            on_click:
+              - lambda: 'id(fc_sel) = 0;'
+              - script.execute: refresh_fc
+        - button:
+            id: fct1
+            x: 130
+            y: 66
+            width: 102
+            height: 150
+            radius: 16
+            bg_color: 0x111111
+            border_width: 0
+            border_color: 0x4DA3FF
+            shadow_width: 0
+            pad_all: 0
+            pressed:
+              bg_color: 0x2A2A2A
+            widgets:
+              - label: { id: fcd_1, align: TOP_MID, y: 8, text: "", text_font: montserrat_16, text_color: 0x8A8F98 }
+              - label: { id: fci_1, align: TOP_MID, y: 32, text: "", text_font: icon_s, text_color: 0xCFCFCF }
+              - label: { id: fch_1, align: TOP_MID, y: 76, text: "", text_font: montserrat_20, text_color: 0xFFFFFF }
+              - label: { id: fcl_1, align: TOP_MID, y: 100, text: "", text_font: montserrat_16, text_color: 0x5A5A5A }
+              - label: { id: fcr_1, align: TOP_MID, y: 124, text: "", text_font: montserrat_14, text_color: 0x4DA3FF }
+            on_click:
+              - lambda: 'id(fc_sel) = 1;'
+              - script.execute: refresh_fc
+        - button:
+            id: fct2
+            x: 240
+            y: 66
+            width: 102
+            height: 150
+            radius: 16
+            bg_color: 0x111111
+            border_width: 0
+            border_color: 0x4DA3FF
+            shadow_width: 0
+            pad_all: 0
+            pressed:
+              bg_color: 0x2A2A2A
+            widgets:
+              - label: { id: fcd_2, align: TOP_MID, y: 8, text: "", text_font: montserrat_16, text_color: 0x8A8F98 }
+              - label: { id: fci_2, align: TOP_MID, y: 32, text: "", text_font: icon_s, text_color: 0xCFCFCF }
+              - label: { id: fch_2, align: TOP_MID, y: 76, text: "", text_font: montserrat_20, text_color: 0xFFFFFF }
+              - label: { id: fcl_2, align: TOP_MID, y: 100, text: "", text_font: montserrat_16, text_color: 0x5A5A5A }
+              - label: { id: fcr_2, align: TOP_MID, y: 124, text: "", text_font: montserrat_14, text_color: 0x4DA3FF }
+            on_click:
+              - lambda: 'id(fc_sel) = 2;'
+              - script.execute: refresh_fc
+        - button:
+            id: fct3
+            x: 350
+            y: 66
+            width: 102
+            height: 150
+            radius: 16
+            bg_color: 0x111111
+            border_width: 0
+            border_color: 0x4DA3FF
+            shadow_width: 0
+            pad_all: 0
+            pressed:
+              bg_color: 0x2A2A2A
+            widgets:
+              - label: { id: fcd_3, align: TOP_MID, y: 8, text: "", text_font: montserrat_16, text_color: 0x8A8F98 }
+              - label: { id: fci_3, align: TOP_MID, y: 32, text: "", text_font: icon_s, text_color: 0xCFCFCF }
+              - label: { id: fch_3, align: TOP_MID, y: 76, text: "", text_font: montserrat_20, text_color: 0xFFFFFF }
+              - label: { id: fcl_3, align: TOP_MID, y: 100, text: "", text_font: montserrat_16, text_color: 0x5A5A5A }
+              - label: { id: fcr_3, align: TOP_MID, y: 124, text: "", text_font: montserrat_14, text_color: 0x4DA3FF }
+            on_click:
+              - lambda: 'id(fc_sel) = 3;'
+              - script.execute: refresh_fc
+        - button:
+            id: fct4
+            x: 460
+            y: 66
+            width: 102
+            height: 150
+            radius: 16
+            bg_color: 0x111111
+            border_width: 0
+            border_color: 0x4DA3FF
+            shadow_width: 0
+            pad_all: 0
+            pressed:
+              bg_color: 0x2A2A2A
+            widgets:
+              - label: { id: fcd_4, align: TOP_MID, y: 8, text: "", text_font: montserrat_16, text_color: 0x8A8F98 }
+              - label: { id: fci_4, align: TOP_MID, y: 32, text: "", text_font: icon_s, text_color: 0xCFCFCF }
+              - label: { id: fch_4, align: TOP_MID, y: 76, text: "", text_font: montserrat_20, text_color: 0xFFFFFF }
+              - label: { id: fcl_4, align: TOP_MID, y: 100, text: "", text_font: montserrat_16, text_color: 0x5A5A5A }
+              - label: { id: fcr_4, align: TOP_MID, y: 124, text: "", text_font: montserrat_14, text_color: 0x4DA3FF }
+            on_click:
+              - lambda: 'id(fc_sel) = 4;'
+              - script.execute: refresh_fc
+        - button:
+            id: fct5
+            x: 570
+            y: 66
+            width: 102
+            height: 150
+            radius: 16
+            bg_color: 0x111111
+            border_width: 0
+            border_color: 0x4DA3FF
+            shadow_width: 0
+            pad_all: 0
+            pressed:
+              bg_color: 0x2A2A2A
+            widgets:
+              - label: { id: fcd_5, align: TOP_MID, y: 8, text: "", text_font: montserrat_16, text_color: 0x8A8F98 }
+              - label: { id: fci_5, align: TOP_MID, y: 32, text: "", text_font: icon_s, text_color: 0xCFCFCF }
+              - label: { id: fch_5, align: TOP_MID, y: 76, text: "", text_font: montserrat_20, text_color: 0xFFFFFF }
+              - label: { id: fcl_5, align: TOP_MID, y: 100, text: "", text_font: montserrat_16, text_color: 0x5A5A5A }
+              - label: { id: fcr_5, align: TOP_MID, y: 124, text: "", text_font: montserrat_14, text_color: 0x4DA3FF }
+            on_click:
+              - lambda: 'id(fc_sel) = 5;'
+              - script.execute: refresh_fc
+        - button:
+            id: fct6
+            x: 680
+            y: 66
+            width: 102
+            height: 150
+            radius: 16
+            bg_color: 0x111111
+            border_width: 0
+            border_color: 0x4DA3FF
+            shadow_width: 0
+            pad_all: 0
+            pressed:
+              bg_color: 0x2A2A2A
+            widgets:
+              - label: { id: fcd_6, align: TOP_MID, y: 8, text: "", text_font: montserrat_16, text_color: 0x8A8F98 }
+              - label: { id: fci_6, align: TOP_MID, y: 32, text: "", text_font: icon_s, text_color: 0xCFCFCF }
+              - label: { id: fch_6, align: TOP_MID, y: 76, text: "", text_font: montserrat_20, text_color: 0xFFFFFF }
+              - label: { id: fcl_6, align: TOP_MID, y: 100, text: "", text_font: montserrat_16, text_color: 0x5A5A5A }
+              - label: { id: fcr_6, align: TOP_MID, y: 124, text: "", text_font: montserrat_14, text_color: 0x4DA3FF }
+            on_click:
+              - lambda: 'id(fc_sel) = 6;'
+              - script.execute: refresh_fc
+        # selected day details
+        - obj: { x: 20, y: 228, width: 760, height: 244, radius: 16, bg_color: 0x0C0C0C, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - label: { id: fcx_title, x: 40, y: 242, width: 720, text: "", text_font: montserrat_24, text_color: 0xFFFFFF }
+        - label: { id: fcx_stats, x: 40, y: 276, width: 720, text: "", text_font: montserrat_16, text_color: 0xCFCFCF }
+        - label: { x: 560, y: 304, text: "Temp", text_font: montserrat_14, text_color: 0xFFFFFF }
+        - label: { x: 620, y: 304, text: "Rain", text_font: montserrat_14, text_color: 0x4DA3FF }
+        - label: { id: fx_tmax, x: 26, y: 330, text: "", text_font: montserrat_14, text_color: 0x5A5A5A }
+        - label: { id: fx_tmin, x: 26, y: 432, text: "", text_font: montserrat_14, text_color: 0x5A5A5A }
+        - label: { id: fx_note, x: 40, y: 380, width: 720, text: "", text_font: montserrat_16, text_color: 0x5A5A5A, text_align: CENTER }
+        - obj: { x: 60, y: 452, width: 700, height: 1, radius: 0, bg_color: 0x2A2A2A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - obj: { id: fx_b0, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b1, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b2, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b3, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b4, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b5, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b6, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b7, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b8, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b9, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b10, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b11, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b12, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b13, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b14, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b15, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b16, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b17, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b18, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b19, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b20, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b21, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b22, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_b23, x: 0, y: 450, width: 4, height: 3, radius: 2, bg_color: 0x4DA3FF, bg_opa: 70%, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d0, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d1, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d2, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d3, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d4, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d5, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d6, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d7, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d8, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d9, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d10, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d11, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d12, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d13, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d14, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d15, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d16, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d17, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d18, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d19, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d20, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d21, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d22, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - obj: { id: fx_d23, x: 0, y: 400, width: 10, height: 10, radius: 5, bg_color: 0xFFFFFF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false, hidden: true }
+        - label: { id: fx_h0, x: 0, y: 456, width: 60, text: "", text_font: montserrat_14, text_color: 0x5A5A5A, text_align: CENTER }
+        - label: { id: fx_h1, x: 0, y: 456, width: 60, text: "", text_font: montserrat_14, text_color: 0x5A5A5A, text_align: CENTER }
+        - label: { id: fx_h2, x: 0, y: 456, width: 60, text: "", text_font: montserrat_14, text_color: 0x5A5A5A, text_align: CENTER }
+        - label: { id: fx_h3, x: 0, y: 456, width: 60, text: "", text_font: montserrat_14, text_color: 0x5A5A5A, text_align: CENTER }
+        - label: { id: fx_h4, x: 0, y: 456, width: 60, text: "", text_font: montserrat_14, text_color: 0x5A5A5A, text_align: CENTER }
+        - label: { id: fx_h5, x: 0, y: 456, width: 60, text: "", text_font: montserrat_14, text_color: 0x5A5A5A, text_align: CENTER }
+
+    # ======================= ENERGY =======================
+    - id: energy_page
+      bg_color: 0x000000
+      scrollable: false
+      widgets:
+        - button:
+            x: 16
+            y: 10
+            width: 56
+            height: 46
+            radius: 12
+            bg_color: 0x111111
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x2A2A2A
+            widgets:
+              - label: { align: CENTER, text: "\U000F004D", text_font: icon_s, text_color: 0xFFFFFF }
+            on_click:
+              - lvgl.page.show: { id: history_page, animation: NONE }
+        - label: { x: 88, y: 18, text: "Energy", text_font: montserrat_28, text_color: 0xFFFFFF }
+        - label: { x: 560, y: 24, text: "Heat", text_font: montserrat_16, text_color: 0xFF7A1A }
+        - label: { x: 620, y: 24, text: "AC", text_font: montserrat_16, text_color: 0x4DA3FF }
+        - obj:
+            x: 20
+            y: 66
+            width: 180
+            height: 112
+            radius: 16
+            bg_color: 0x111111
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            widgets:
+              - label: { x: 12, y: 10, text: "Today", text_font: montserrat_16, text_color: 0x5A5A5A }
+              - label: { id: en_d, x: 12, y: 36, text: "--", text_font: montserrat_36, text_color: 0xFFFFFF }
+              - label: { id: en_ds, x: 12, y: 84, width: 160, text: "", text_font: montserrat_14, text_color: 0x8A8F98 }
+        - obj:
+            x: 212
+            y: 66
+            width: 180
+            height: 112
+            radius: 16
+            bg_color: 0x111111
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            widgets:
+              - label: { x: 12, y: 10, text: "This week", text_font: montserrat_16, text_color: 0x5A5A5A }
+              - label: { id: en_w, x: 12, y: 36, text: "--", text_font: montserrat_36, text_color: 0xFFFFFF }
+              - label: { id: en_ws, x: 12, y: 84, width: 160, text: "", text_font: montserrat_14, text_color: 0x8A8F98 }
+        - obj:
+            x: 404
+            y: 66
+            width: 180
+            height: 112
+            radius: 16
+            bg_color: 0x111111
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            widgets:
+              - label: { x: 12, y: 10, text: "This month", text_font: montserrat_16, text_color: 0x5A5A5A }
+              - label: { id: en_m, x: 12, y: 36, text: "--", text_font: montserrat_36, text_color: 0xFFFFFF }
+              - label: { id: en_ms, x: 12, y: 84, width: 160, text: "", text_font: montserrat_14, text_color: 0x8A8F98 }
+        - obj:
+            x: 596
+            y: 66
+            width: 180
+            height: 112
+            radius: 16
+            bg_color: 0x111111
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            widgets:
+              - label: { x: 12, y: 10, text: "Last month", text_font: montserrat_16, text_color: 0x5A5A5A }
+              - label: { id: en_l, x: 12, y: 36, text: "--", text_font: montserrat_36, text_color: 0xFFFFFF }
+        - obj:
+            x: 20
+            y: 188
+            width: 756
+            height: 58
+            radius: 16
+            bg_color: 0x111111
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            widgets:
+              - label: { x: 16, y: 6, text: "Whole house bill so far", text_font: montserrat_14, text_color: 0x5A5A5A }
+              - label: { id: hs_cost, x: 16, y: 24, text: "--", text_font: montserrat_24, text_color: 0xFFFFFF }
+              - label: { x: 206, y: 6, text: "Bill forecast", text_font: montserrat_14, text_color: 0x5A5A5A }
+              - label: { id: hs_fcst, x: 206, y: 24, text: "--", text_font: montserrat_24, text_color: 0xFFFFFF }
+              - label: { x: 396, y: 6, text: "Typical month", text_font: montserrat_14, text_color: 0x5A5A5A }
+              - label: { id: hs_typ, x: 396, y: 24, text: "--", text_font: montserrat_24, text_color: 0xFFFFFF }
+              - label: { x: 586, y: 6, text: "vs typical", text_font: montserrat_14, text_color: 0x5A5A5A }
+              - label: { id: hs_vs, x: 586, y: 24, text: "--", text_font: montserrat_24, text_color: 0xFFFFFF }
+        - label: { id: en_proj, x: 24, y: 254, width: 760, text: "", text_font: montserrat_14, text_color: 0xCFCFCF }
+        - label: { x: 24, y: 276, text: "Heating + cooling hours, last 7 days", text_font: montserrat_16, text_color: 0x5A5A5A }
+        - obj: { x: 24, y: 432, width: 752, height: 2, radius: 0, bg_color: 0x2A2A2A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - obj: { id: eh0, x: 44, y: 430, width: 52, height: 2, radius: 4, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - obj: { id: ec0, x: 44, y: 428, width: 52, height: 2, radius: 4, bg_color: 0x4DA3FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - label: { id: ev0, x: 30, y: 400, width: 80, text: "", text_font: montserrat_14, text_color: 0xCFCFCF, text_align: CENTER }
+        - label: { id: ed0, x: 30, y: 440, width: 80, text: "", text_font: montserrat_16, text_color: 0x8A8F98, text_align: CENTER }
+        - obj: { id: eh1, x: 150, y: 430, width: 52, height: 2, radius: 4, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - obj: { id: ec1, x: 150, y: 428, width: 52, height: 2, radius: 4, bg_color: 0x4DA3FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - label: { id: ev1, x: 136, y: 400, width: 80, text: "", text_font: montserrat_14, text_color: 0xCFCFCF, text_align: CENTER }
+        - label: { id: ed1, x: 136, y: 440, width: 80, text: "", text_font: montserrat_16, text_color: 0x8A8F98, text_align: CENTER }
+        - obj: { id: eh2, x: 256, y: 430, width: 52, height: 2, radius: 4, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - obj: { id: ec2, x: 256, y: 428, width: 52, height: 2, radius: 4, bg_color: 0x4DA3FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - label: { id: ev2, x: 242, y: 400, width: 80, text: "", text_font: montserrat_14, text_color: 0xCFCFCF, text_align: CENTER }
+        - label: { id: ed2, x: 242, y: 440, width: 80, text: "", text_font: montserrat_16, text_color: 0x8A8F98, text_align: CENTER }
+        - obj: { id: eh3, x: 362, y: 430, width: 52, height: 2, radius: 4, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - obj: { id: ec3, x: 362, y: 428, width: 52, height: 2, radius: 4, bg_color: 0x4DA3FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - label: { id: ev3, x: 348, y: 400, width: 80, text: "", text_font: montserrat_14, text_color: 0xCFCFCF, text_align: CENTER }
+        - label: { id: ed3, x: 348, y: 440, width: 80, text: "", text_font: montserrat_16, text_color: 0x8A8F98, text_align: CENTER }
+        - obj: { id: eh4, x: 468, y: 430, width: 52, height: 2, radius: 4, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - obj: { id: ec4, x: 468, y: 428, width: 52, height: 2, radius: 4, bg_color: 0x4DA3FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - label: { id: ev4, x: 454, y: 400, width: 80, text: "", text_font: montserrat_14, text_color: 0xCFCFCF, text_align: CENTER }
+        - label: { id: ed4, x: 454, y: 440, width: 80, text: "", text_font: montserrat_16, text_color: 0x8A8F98, text_align: CENTER }
+        - obj: { id: eh5, x: 574, y: 430, width: 52, height: 2, radius: 4, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - obj: { id: ec5, x: 574, y: 428, width: 52, height: 2, radius: 4, bg_color: 0x4DA3FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - label: { id: ev5, x: 560, y: 400, width: 80, text: "", text_font: montserrat_14, text_color: 0xCFCFCF, text_align: CENTER }
+        - label: { id: ed5, x: 560, y: 440, width: 80, text: "", text_font: montserrat_16, text_color: 0x8A8F98, text_align: CENTER }
+        - obj: { id: eh6, x: 680, y: 430, width: 52, height: 2, radius: 4, bg_color: 0xFF7A1A, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - obj: { id: ec6, x: 680, y: 428, width: 52, height: 2, radius: 4, bg_color: 0x4DA3FF, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - label: { id: ev6, x: 666, y: 400, width: 80, text: "", text_font: montserrat_14, text_color: 0xCFCFCF, text_align: CENTER }
+        - label: { id: ed6, x: 666, y: 440, width: 80, text: "", text_font: montserrat_16, text_color: 0xFFFFFF, text_align: CENTER }
+
+    # ======================= NETWORK =======================
+    - id: network_page
+      bg_color: 0x000000
+      scrollable: false
+      widgets:
+        - button:
+            x: 16
+            y: 10
+            width: 56
+            height: 46
+            radius: 12
+            bg_color: 0x111111
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x2A2A2A
+            widgets:
+              - label: { align: CENTER, text: "\U000F004D", text_font: icon_s, text_color: 0xFFFFFF }
+            on_click:
+              - lvgl.page.show: { id: home_page, animation: NONE }
+        - label: { x: 88, y: 18, text: "Network", text_font: montserrat_28, text_color: 0xFFFFFF }
+
+        # this display's connection
+        - obj:
+            x: 20
+            y: 70
+            width: 370
+            height: 390
+            radius: 16
+            bg_color: 0x111111
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            widgets:
+              - label: { x: 16, y: 14, text: "This display", text_font: montserrat_16, text_color: 0x5A5A5A }
+              - label: { x: 16, y: 56, text: "Network", text_font: montserrat_20, text_color: 0x8A8F98 }
+              - label: { id: net_name, x: 170, y: 56, width: 190, long_mode: DOT, text: "--", text_font: montserrat_20, text_color: 0xFFFFFF }
+              - label: { x: 16, y: 104, text: "Signal", text_font: montserrat_20, text_color: 0x8A8F98 }
+              - label: { id: net_sig, x: 170, y: 104, width: 190, long_mode: DOT, text: "--", text_font: montserrat_20, text_color: 0xFFFFFF }
+              - label: { x: 16, y: 152, text: "IP address", text_font: montserrat_20, text_color: 0x8A8F98 }
+              - label: { id: net_ipl, x: 170, y: 152, width: 190, long_mode: DOT, text: "--", text_font: montserrat_20, text_color: 0xFFFFFF }
+              - label: { x: 16, y: 200, text: "Home Assistant", text_font: montserrat_20, text_color: 0x8A8F98 }
+              - label: { id: net_ha, x: 170, y: 200, width: 190, long_mode: DOT, text: "--", text_font: montserrat_20, text_color: 0xFFFFFF }
+              - label: { x: 16, y: 248, text: "Running for", text_font: montserrat_20, text_color: 0x8A8F98 }
+              - label: { id: net_up, x: 170, y: 248, width: 190, long_mode: DOT, text: "--", text_font: montserrat_20, text_color: 0xFFFFFF }
+              - label: { x: 16, y: 310, width: 340, text: "Signal: Excellent / Good is fine. Fair or Weak means the display is far from the router.", long_mode: WRAP, text_font: montserrat_14, text_color: 0x5A5A5A }
+
+        # internet speed (measured by Home Assistant on the NAS)
+        - obj:
+            x: 410
+            y: 70
+            width: 370
+            height: 390
+            radius: 16
+            bg_color: 0x111111
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            widgets:
+              - label: { x: 16, y: 14, text: "Internet speed", text_font: montserrat_16, text_color: 0x5A5A5A }
+              - label: { id: net_down, x: 10, y: 64, width: 110, text: "--", text_font: montserrat_48, text_color: 0xFFFFFF, text_align: CENTER }
+              - label: { x: 10, y: 122, width: 110, text: "Mbit/s", text_font: montserrat_16, text_color: 0x8A8F98, text_align: CENTER }
+              - label: { x: 10, y: 42, width: 110, text: "Download", text_font: montserrat_16, text_color: 0x5A5A5A, text_align: CENTER }
+              - label: { id: net_upl, x: 130, y: 64, width: 110, text: "--", text_font: montserrat_48, text_color: 0xFFFFFF, text_align: CENTER }
+              - label: { x: 130, y: 122, width: 110, text: "Mbit/s", text_font: montserrat_16, text_color: 0x8A8F98, text_align: CENTER }
+              - label: { x: 130, y: 42, width: 110, text: "Upload", text_font: montserrat_16, text_color: 0x5A5A5A, text_align: CENTER }
+              - label: { id: net_ping, x: 250, y: 64, width: 110, text: "--", text_font: montserrat_48, text_color: 0xFFFFFF, text_align: CENTER }
+              - label: { x: 250, y: 122, width: 110, text: "ms", text_font: montserrat_16, text_color: 0x8A8F98, text_align: CENTER }
+              - label: { x: 250, y: 42, width: 110, text: "Ping", text_font: montserrat_16, text_color: 0x5A5A5A, text_align: CENTER }
+              - label: { id: net_inet, x: 16, y: 170, width: 340, text: "", long_mode: WRAP, text_font: montserrat_16, text_color: 0xCFCFCF }
+              - button:
+                  x: 16
+                  y: 240
+                  width: 338
+                  height: 60
+                  radius: 14
+                  bg_color: 0x1E3A5F
+                  border_width: 0
+                  shadow_width: 0
+                  pressed:
+                    bg_color: 0x2B5288
+                  widgets:
+                    - label: { align: CENTER, text: "Run speed test", text_font: montserrat_20, text_color: 0xFFFFFF }
+                  on_click:
+                    - lambda: 'id(spd_testing) = millis();'
+                    - script.execute: refresh_net
+                    - homeassistant.action:
+                        action: homeassistant.update_entity
+                        data:
+                          entity_id: ${speed_down}
+              - label: { x: 16, y: 316, width: 340, text: "Tested from the NAS, so it shows your home internet speed (not this display's WiFi).", long_mode: WRAP, text_font: montserrat_14, text_color: 0x5A5A5A }
+
+    # ======================= SETTINGS =======================
+    - id: settings_page
+      bg_color: 0x000000
+      scrollable: false
+      widgets:
+        - button:
+            x: 16
+            y: 8
+            width: 56
+            height: 46
+            radius: 14
+            bg_color: 0x111111
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x333333
+            widgets:
+              - label: { align: CENTER, text: "\U000F004D", text_font: icon_s, text_color: 0xFFFFFF }
+            on_click:
+              - lvgl.page.show: { id: home_page, animation: NONE }
+        - label: { x: 88, y: 16, text: "Settings", text_font: montserrat_28, text_color: 0xFFFFFF }
+        - label: { id: lbl_safety, x: 250, y: 22, width: 530, long_mode: DOT, text: "", text_font: montserrat_16, text_color: 0xFF453A }
+        - label: { x: 24, y: 70, text: "Temperature from", text_font: montserrat_20, text_color: 0xCFCFCF }
+        - button:
+            id: btn_src0
+            x: 300
+            y: 66
+            width: 150
+            height: 50
+            radius: 14
+            bg_color: 0x161616
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x333333
+            widgets:
+              - label: { align: CENTER, text: "Wall", text_font: montserrat_20, text_color: 0xFFFFFF }
+            on_click:
+              - script.execute: { id: set_source, opt: "Wall sensor" }
+        - button:
+            id: btn_src1
+            x: 462
+            y: 66
+            width: 150
+            height: 50
+            radius: 14
+            bg_color: 0x161616
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x333333
+            widgets:
+              - label: { align: CENTER, text: "Average", text_font: montserrat_20, text_color: 0xFFFFFF }
+            on_click:
+              - script.execute: { id: set_source, opt: "Average" }
+        - button:
+            id: btn_src2
+            x: 624
+            y: 66
+            width: 150
+            height: 50
+            radius: 14
+            bg_color: 0x161616
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x333333
+            widgets:
+              - label: { align: CENTER, text: "Govee", text_font: montserrat_20, text_color: 0xFFFFFF }
+            on_click:
+              - script.execute: { id: set_source, opt: "Govee room" }
+        - label: { x: 24, y: 142, text: "Preset", text_font: montserrat_20, text_color: 0xCFCFCF }
+        - button:
+            id: btn_pr0
+            x: 300
+            y: 138
+            width: 150
+            height: 50
+            radius: 14
+            bg_color: 0x161616
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x333333
+            widgets:
+              - label: { align: CENTER, text: "Home", text_font: montserrat_20, text_color: 0xFFFFFF }
+            on_click:
+              - script.execute: { id: set_preset, pr: "Home" }
+        - button:
+            id: btn_pr1
+            x: 462
+            y: 138
+            width: 150
+            height: 50
+            radius: 14
+            bg_color: 0x161616
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x333333
+            widgets:
+              - label: { align: CENTER, text: "Away", text_font: montserrat_20, text_color: 0xFFFFFF }
+            on_click:
+              - script.execute: { id: set_preset, pr: "Away" }
+        - button:
+            id: btn_pr2
+            x: 624
+            y: 138
+            width: 150
+            height: 50
+            radius: 14
+            bg_color: 0x161616
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x333333
+            widgets:
+              - label: { align: CENTER, text: "Sleep", text_font: montserrat_20, text_color: 0xFFFFFF }
+            on_click:
+              - script.execute: { id: set_preset, pr: "Sleep" }
+        - label: { x: 24, y: 214, text: "Smart pre-heat", text_font: montserrat_20, text_color: 0xCFCFCF }
+        - label: { id: lbl_pre_status, x: 24, y: 240, width: 270, text: "", text_font: montserrat_14, text_color: 0x5A5A5A }
+        - button:
+            id: btn_pre
+            x: 300
+            y: 210
+            width: 150
+            height: 50
+            radius: 14
+            bg_color: 0x161616
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x333333
+            widgets:
+              - label: { id: lbl_pre_on, align: CENTER, text: "Off", text_font: montserrat_20, text_color: 0xFFFFFF }
+            on_click:
+              - homeassistant.action:
+                  action: switch.toggle
+                  data:
+                    entity_id: ${pre_switch}
+        - label: { x: 466, y: 224, text: "to", text_font: montserrat_20, text_color: 0x8A8F98 }
+        - button:
+            x: 500
+            y: 210
+            width: 60
+            height: 50
+            radius: 14
+            bg_color: 0x161616
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x333333
+            widgets:
+              - label: { align: CENTER, text: "-", text_font: montserrat_28, text_color: 0xFFFFFF }
+            on_click:
+              - lambda: 'id(st_pre_temp) = std::max(60.0f, id(st_pre_temp) - 1); id(st_edit) = millis();'
+              - script.execute: refresh_settings
+              - script.execute: send_pre_temp
+        - label: { id: lbl_pre_temp, x: 566, y: 220, width: 96, text: "68°", text_font: montserrat_28, text_color: 0xFF7A1A, text_align: CENTER }
+        - button:
+            x: 668
+            y: 210
+            width: 60
+            height: 50
+            radius: 14
+            bg_color: 0x161616
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x333333
+            widgets:
+              - label: { align: CENTER, text: "+", text_font: montserrat_28, text_color: 0xFFFFFF }
+            on_click:
+              - lambda: 'id(st_pre_temp) = std::min(78.0f, id(st_pre_temp) + 1); id(st_edit) = millis();'
+              - script.execute: refresh_settings
+              - script.execute: send_pre_temp
+        - label: { x: 24, y: 286, text: "Warm by", text_font: montserrat_20, text_color: 0xCFCFCF }
+        - label: { id: lbl_rate, x: 24, y: 312, width: 270, text: "", text_font: montserrat_14, text_color: 0x5A5A5A }
+        - button:
+            x: 300
+            y: 282
+            width: 60
+            height: 50
+            radius: 14
+            bg_color: 0x161616
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x333333
+            widgets:
+              - label: { align: CENTER, text: "-", text_font: montserrat_28, text_color: 0xFFFFFF }
+            on_click:
+              - lambda: 'id(st_pre_min) = (id(st_pre_min) + 1440 - 15) % 1440; id(st_edit) = millis();'
+              - script.execute: refresh_settings
+              - script.execute: send_pre_time
+        - label: { id: lbl_pre_time, x: 366, y: 292, width: 128, text: "6:30 AM", text_font: montserrat_28, text_color: 0xFFFFFF, text_align: CENTER }
+        - button:
+            x: 500
+            y: 282
+            width: 60
+            height: 50
+            radius: 14
+            bg_color: 0x161616
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x333333
+            widgets:
+              - label: { align: CENTER, text: "+", text_font: montserrat_28, text_color: 0xFFFFFF }
+            on_click:
+              - lambda: 'id(st_pre_min) = (id(st_pre_min) + 15) % 1440; id(st_edit) = millis();'
+              - script.execute: refresh_settings
+              - script.execute: send_pre_time
+        - label: { x: 24, y: 358, text: "Fan after heat/cool", text_font: montserrat_20, text_color: 0xCFCFCF }
+        - button:
+            x: 300
+            y: 354
+            width: 60
+            height: 50
+            radius: 14
+            bg_color: 0x161616
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x333333
+            widgets:
+              - label: { align: CENTER, text: "-", text_font: montserrat_28, text_color: 0xFFFFFF }
+            on_click:
+              - lambda: 'id(st_fan) = std::max(0, id(st_fan) - 1); id(st_edit) = millis();'
+              - script.execute: refresh_settings
+              - script.execute: send_fan
+        - label: { id: lbl_fan, x: 366, y: 364, width: 128, text: "1 min", text_font: montserrat_28, text_color: 0xFFFFFF, text_align: CENTER }
+        - button:
+            x: 500
+            y: 354
+            width: 60
+            height: 50
+            radius: 14
+            bg_color: 0x161616
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x333333
+            widgets:
+              - label: { align: CENTER, text: "+", text_font: montserrat_28, text_color: 0xFFFFFF }
+            on_click:
+              - lambda: 'id(st_fan) = std::min(30, id(st_fan) + 1); id(st_edit) = millis();'
+              - script.execute: refresh_settings
+              - script.execute: send_fan
+        - button:
+            x: 576
+            y: 354
+            width: 204
+            height: 50
+            radius: 14
+            bg_color: 0x161616
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x333333
+            widgets:
+              - label: { id: lbl_theme, align: CENTER, text: "Theme: Auto", text_font: montserrat_20, text_color: 0xFFFFFF }
+            on_click:
+              - select.next: { id: holiday_override, cycle: true }
+              - script.execute: refresh_settings
+        - label: { x: 24, y: 430, text: "Air filter", text_font: montserrat_20, text_color: 0xCFCFCF }
+        - label: { x: 24, y: 456, width: 270, text: "Hold the button after a new filter", text_font: montserrat_14, text_color: 0x5A5A5A }
+        - obj: { x: 300, y: 456, width: 190, height: 10, radius: 5, bg_color: 0x222222, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - obj: { id: filter_bar, x: 300, y: 456, width: 4, height: 10, radius: 5, bg_color: 0x34C759, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+        - label: { id: lbl_filter, x: 300, y: 426, width: 190, text: "--", text_font: montserrat_20, text_color: 0x34C759 }
+        # hold for 2 seconds: green fill shows progress, reset happens when it's full
+        - button:
+            id: btn_filter
+            x: 506
+            y: 426
+            width: 274
+            height: 50
+            radius: 14
+            bg_color: 0x161616
+            border_width: 0
+            shadow_width: 0
+            pad_all: 0
+            clip_corner: true
+            widgets:
+              - obj: { id: filter_fill, x: 0, y: 0, width: 0, height: 50, radius: 0, bg_color: 0x1F8A3B, bg_opa: COVER, border_width: 0, pad_all: 0, scrollable: false, clickable: false }
+              - label: { id: lbl_filter_btn, align: CENTER, text: "Hold: new filter put in", text_font: montserrat_20, text_color: 0xFFFFFF }
+            on_press:
+              - lambda: |-
+                  #if LVGL_VERSION_MAJOR >= 9
+                  #define TSTAT_ANIM_DEL lv_anim_delete
+                  #else
+                  #define TSTAT_ANIM_DEL lv_anim_del
+                  #endif
+                  TSTAT_ANIM_DEL(id(filter_fill), NULL);
+                  lv_anim_t a;
+                  lv_anim_init(&a);
+                  lv_anim_set_var(&a, id(filter_fill));
+                  lv_anim_set_exec_cb(&a, [](void *o, int32_t w) { lv_obj_set_width((lv_obj_t *) o, w); });
+                  lv_anim_set_values(&a, 0, 274);
+                  #if LVGL_VERSION_MAJOR >= 9
+                  lv_anim_set_duration(&a, 2000);
+                  #else
+                  lv_anim_set_time(&a, 2000);
+                  #endif
+                  lv_anim_set_ready_cb(&a, [](lv_anim_t *) { id(filter_reset_go).execute(); });
+                  lv_anim_start(&a);
+            on_release:
+              - lambda: |-
+                  // let go early = cancel
+                  if (lv_obj_get_width(id(filter_fill)) < 274) {
+                  #if LVGL_VERSION_MAJOR >= 9
+                    lv_anim_delete(id(filter_fill), NULL);
+                  #else
+                    lv_anim_del(id(filter_fill), NULL);
+                  #endif
+                    lv_obj_set_width(id(filter_fill), 0);
+                  }
+
+    # ======================= HISTORY =======================
+    - id: history_page
+      bg_color: 0x000000
+      widgets:
+        - button:
+            x: 16
+            y: 10
+            width: 56
+            height: 46
+            radius: 12
+            bg_color: 0x111111
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x2A2A2A
+            widgets:
+              - label: { align: CENTER, text: "\U000F004D", text_font: icon_s, text_color: 0xFFFFFF }
+            on_click:
+              - lvgl.page.show: { id: home_page, animation: NONE }
+        - label: { x: 88, y: 18, text: "History", text_font: montserrat_28, text_color: 0xFFFFFF }
+        - button:
+            x: 404
+            y: 10
+            width: 140
+            height: 46
+            radius: 12
+            bg_color: 0x2A1A06
+            border_width: 0
+            shadow_width: 0
+            pressed:
+              bg_color: 0x4A300E
+            widgets:
+              - label: { align: CENTER, text: "Energy  $", text_font: montserrat_20, text_color: 0xFFB020 }
+            on_click:
+              - lvgl.page.show: { id: energy_page, animation: NONE }
+              - script.execute: refresh_energy
+        - button:
+            id: btn_24h
+            x: 560
+            y: 10
+            width: 100
+            height: 46
+            radius: 12
+            bg_color: 0x3A3A3A
+            border_width: 0
+            shadow_width: 0
+            widgets:
+              - label: { align: CENTER, text: "24h", text_font: montserrat_20, text_color: 0xFFFFFF }
+            on_click:
+              - lambda: 'id(show_week) = false;'
+              - script.execute: set_range
+        - button:
+            id: btn_7d
+            x: 672
+            y: 10
+            width: 112
+            height: 46
+            radius: 12
+            bg_color: 0x1A1A1A
+            border_width: 0
+            shadow_width: 0
+            widgets:
+              - label: { align: CENTER, text: "7 days", text_font: montserrat_20, text_color: 0xFFFFFF }
+            on_click:
+              - lambda: 'id(show_week) = true;'
+              - script.execute: set_range
+
+        # live cards
+        - obj:
+            x: 20
+            y: 66
+            width: 240
+            height: 72
+            pad_all: 10
+            radius: 14
+            bg_color: 0x111111
+            border_width: 0
+            scrollable: false
+            widgets:
+              - label: { align: TOP_LEFT, text: "Govee", text_font: montserrat_16, text_color: 0x34C759 }
+              - label: { id: gov_now, align: BOTTOM_RIGHT, text: "--", text_font: montserrat_24, text_color: 0xFFFFFF }
+        - obj:
+            x: 280
+            y: 66
+            width: 240
+            height: 72
+            pad_all: 10
+            radius: 14
+            bg_color: 0x111111
+            border_width: 0
+            scrollable: false
+            widgets:
+              - label: { align: TOP_LEFT, text: "Thermostat", text_font: montserrat_16, text_color: 0xFFFFFF }
+              - label: { id: room_now, align: BOTTOM_RIGHT, text: "--", text_font: montserrat_24, text_color: 0xFFFFFF }
+        - obj:
+            x: 540
+            y: 66
+            width: 240
+            height: 72
+            pad_all: 10
+            radius: 14
+            bg_color: 0x111111
+            border_width: 0
+            scrollable: false
+            widgets:
+              - label: { id: cost_lbl, align: TOP_LEFT, text: "A/C cost - today", text_font: montserrat_16, text_color: 0xFF7A1A }
+              - label: { id: cost_now, align: BOTTOM_RIGHT, text: "--", text_font: montserrat_24, text_color: 0xFFFFFF }
+
+        # temperature chart
+        - obj:
+            id: chart_t
+            x: 20
+            y: 146
+            width: 760
+            height: 100
+            radius: 14
+            bg_color: 0x0D0D0D
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            widgets:
+              - label: { x: 46, y: 4, text: "Temperature", text_font: montserrat_14, text_color: 0x8A8F98 }
+              - label: { align: TOP_RIGHT, x: -12, y: 4, text: "• thermostat   • govee", text_font: montserrat_14, text_color: 0x5A5A5A }
+              - label: { id: t_max, x: 6, y: 18, text: "--", text_font: montserrat_14, text_color: 0x5A5A5A }
+              - label: { id: t_min, x: 6, y: 80, text: "", text_font: montserrat_14, text_color: 0x5A5A5A }
+
+        # humidity chart
+        - obj:
+            id: chart_h
+            x: 20
+            y: 252
+            width: 760
+            height: 100
+            radius: 14
+            bg_color: 0x0D0D0D
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            widgets:
+              - label: { x: 46, y: 4, text: "Humidity", text_font: montserrat_14, text_color: 0x8A8F98 }
+              - label: { id: h_max, x: 6, y: 18, text: "--", text_font: montserrat_14, text_color: 0x5A5A5A }
+              - label: { id: h_min, x: 6, y: 80, text: "", text_font: montserrat_14, text_color: 0x5A5A5A }
+
+        # heat / cool runtime chart
+        - obj:
+            id: chart_r
+            x: 20
+            y: 358
+            width: 760
+            height: 100
+            radius: 14
+            bg_color: 0x0D0D0D
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            widgets:
+              - label: { x: 46, y: 4, text: "Heating / cooling time", text_font: montserrat_14, text_color: 0x8A8F98 }
+              - label: { align: TOP_RIGHT, x: -12, y: 4, text: "orange = heat   blue = cool", text_font: montserrat_14, text_color: 0x5A5A5A }
