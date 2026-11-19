@@ -1,6 +1,6 @@
 # DIY Smart Thermostat
 
-A home-built replacement for a White-Rodgers wall thermostat. It uses two ESP32 boards, a 7-inch touchscreen, Home Assistant and Google voice control, and runs a Carrier gas furnace and central AC. It's powered entirely from the furnace's own 24 V, with no batteries and no wall plug.
+A home-built replacement for almost any wall-mounted thermostat. It uses two ESP32 boards, a 7-inch touchscreen, Home Assistant and Google voice control, and controls a Carrier gas furnace and central AC. Powered entirely from the furnace's own 24 V, with no batteries and no wall plug.
 
 ![The touchscreen on the wall](photos/wall-mountedV2.jpeg)
 
